@@ -11,6 +11,7 @@ import argparse
 from importlib.metadata import version
 
 from isaaclab.app import AppLauncher
+from unitree_rl_lab.perception.object_detection import ObjectDetector
 
 # local imports
 import cli_args  # isort: skip
@@ -159,6 +160,10 @@ def main():
         obs, _ = env.get_observations()
     timestep = 0
     # simulate environment
+    
+    detector = ObjectDetector(target_classes=("bottle",), confidence_threshold=0.25)
+    frame_count = 0
+
     while simulation_app.is_running():
         start_time = time.time()
         # run everything in inference mode
@@ -167,6 +172,18 @@ def main():
             actions = policy(obs)
             # env stepping
             obs, _, _, _ = env.step(actions)
+
+        with torch.inference_mode():
+            actions = policy(obs)
+            obs, _, _, _ = env.step(actions)
+
+        frame_count += 1
+        if frame_count % 10 == 0:
+            rgb = env.unwrapped.scene["head_camera"].data.output["rgb"][0, ..., :3]  # first robot: (480, 640, 3)
+            frame = rgb.cpu().numpy()[:, :, ::-1].copy()  # RGB tensor on GPU -> BGR numpy array, what YOLO expects
+            detections = detector.detect(frame)
+            print("[YOLO] Detected:" if detections else "[YOLO] No target detected", detections or "")
+
         if args_cli.video:
             timestep += 1
             # Exit the play loop after recording one video

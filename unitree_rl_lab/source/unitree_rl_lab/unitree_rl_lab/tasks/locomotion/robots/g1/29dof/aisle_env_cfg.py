@@ -8,6 +8,7 @@ trained policy still loads) and only changes the world:
   - flat floor instead of the cobblestone terrain
   - two shelf units facing each other, three shelves each
   - an apple (the target) on the left middle shelf, plus YCB grocery products
+  - a head RGB-D camera at the real G1's D435 mount (run with --enable_cameras)
   - no random pushes, fixed start pose, long episodes
 
 Layout (seen from above, robot starts at the origin facing +x):
@@ -24,8 +25,11 @@ import isaaclab.sim as sim_utils
 from isaaclab.assets import AssetBaseCfg, RigidObjectCfg
 from isaaclab.utils import configclass
 from isaaclab.utils.assets import ISAAC_NUCLEUS_DIR
+from isaaclab.sensors import CameraCfg
 
 from .velocity_env_cfg import RobotPlayEnvCfg, RobotSceneCfg
+import math
+
 
 # ---------------------------------------------------------------------------
 # Aisle dimensions (metres). Change these to reshape the aisle.
@@ -37,6 +41,11 @@ SHELF_CENTER_X = 2.00  # shelves run from x = 1.0 to x = 3.0
 BOARD_THICKNESS = 0.03
 SHELF_HEIGHTS = (0.40, 0.80, 1.10)  # top surface of each board is height + thickness/2
 UNIT_HEIGHT = 1.40  # height of the back panel
+
+# Head camera downward tilt in degrees (0 = straight ahead). The real G1's D435 is 47.6.
+CAMERA_PITCH_DEG = 20.0 #0 straight, 20 natural, 30, lower to middle shelves, 47.6 actual g1
+_pitch = math.radians(CAMERA_PITCH_DEG)
+CAMERA_ROT = (math.cos(_pitch / 2), 0.0, math.sin(_pitch / 2), 0.0)
 
 SHELF_COLOR = (0.75, 0.75, 0.78)
 PANEL_COLOR = (0.55, 0.55, 0.60)
@@ -110,6 +119,27 @@ def grocery_item(name: str, usd_file: str, side: int, level: int, x: float) -> R
 @configclass
 class AisleSceneCfg(RobotSceneCfg):
     """The walking scene (robot, sensors, lights, floor) plus shelves and a target object."""
+
+    # Head RGB-D camera, at the real G1's D435 mount (from Unitree's URDF: d435_joint on torso_link).
+    # The URDF importer merges head_link and d435_link into torso_link, so the camera is attached there.
+    # Cameras only render when the app is launched with --enable_cameras.
+    head_camera = CameraCfg(
+        prim_path="{ENV_REGEX_NS}/Robot/torso_link/head_camera",
+        update_period=0.1,
+        height=480,
+        width=640,
+        data_types=["rgb", "distance_to_image_plane"],
+        spawn=sim_utils.PinholeCameraCfg(
+            focal_length=15.2,  # ~69 deg horizontal field of view, like the D435 colour camera
+            horizontal_aperture=20.955,
+            clipping_range=(0.1, 20.0),
+        ),
+        offset=CameraCfg.OffsetCfg(
+            pos=(0.0576, 0.0175, 0.4299),
+            rot=CAMERA_ROT,  # pitched 47.6 deg down
+            convention="world",  # camera looks along +x (forward), +z up
+        ),
+    )
 
     # left shelf unit (y > 0)
     left_board_0 = board(+1, 0)

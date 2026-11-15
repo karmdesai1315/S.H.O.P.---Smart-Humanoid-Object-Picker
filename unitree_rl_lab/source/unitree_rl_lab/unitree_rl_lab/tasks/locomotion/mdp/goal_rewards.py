@@ -30,12 +30,13 @@ If it still learns to stand still away from the goal, turn these first:
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from typing import TYPE_CHECKING
 
 import torch
 
 from isaaclab.assets import Articulation
-from isaaclab.managers import SceneEntityCfg
+from isaaclab.managers import ManagerTermBase, RewardTermCfg, SceneEntityCfg
 from isaaclab.sensors import ContactSensor
 from isaaclab.utils.math import quat_apply_inverse, yaw_quat
 
@@ -226,6 +227,39 @@ def undesired_contacts(env: ManagerBasedRLEnv, threshold: float, sensor_cfg: Sce
 # ===========================================================================
 # Goal rewards (on top of walking)
 # ===========================================================================
+class GoalDistanceProgress(ManagerTermBase):
+    """Points for getting closer to the goal.
+
+    Uses phi(d) = -(d - flat_dist)^2 (and 0 once inside flat_dist), and pays the change in phi each step:
+      - steepest far away (at the start), flat at flat_dist (0.3 m) and inside it
+      - getting closer -> positive, moving away -> negative, standing still -> 0
+    Per step it pays 2 * (d - flat_dist) * speed toward the goal, so the same step is worth more far away.
+    Divided by step_dt, so over a whole approach the points add up to weight * (d_start - flat_dist)^2
+      e.g. 1.5 m start -> 1.44 * weight, 1.0 m -> 0.49 * weight, 0.5 m -> 0.04 * weight.
+    """
+
+    def __init__(self, cfg: RewardTermCfg, env: ManagerBasedRLEnv):
+        super().__init__(cfg, env)
+        self.prev = torch.zeros(env.num_envs, device=env.device)
+        self.first_step = torch.ones(env.num_envs, dtype=torch.bool, device=env.device)
+
+    def reset(self, env_ids: Sequence[int] | slice | None = None):
+        if env_ids is None:
+            env_ids = slice(None)
+        self.first_step[env_ids] = True  # no "progress" from the jump to a new start position
+
+    def __call__(
+        self, env: ManagerBasedRLEnv, command_name: str = "goal_position", flat_dist: float = 0.3
+    ) -> torch.Tensor:
+        term = env.command_manager.get_term(command_name)
+        phi = -torch.square(torch.clamp(term.goal_distance_xy - flat_dist, min=0.0))
+        prev = torch.where(self.first_step, phi, self.prev)
+        reward = (phi - prev) / env.step_dt
+        self.prev[:] = phi
+        self.first_step[:] = False
+        return reward
+
+
 def fall_penalty(env: ManagerBasedRLEnv, term_names: list[str] = ["base_height", "bad_orientation"]) -> torch.Tensor:
     """1 on the step the robot falls (any of the fall terminations). Give it a negative weight."""
     fell = torch.zeros(env.num_envs, dtype=torch.bool, device=env.device)

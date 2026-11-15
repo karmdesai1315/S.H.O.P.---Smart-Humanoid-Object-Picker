@@ -411,6 +411,9 @@ class RewardsCfg:
     )
 
     # -- goal (on top of walking)
+    goal_progress = RewTerm(
+        func=rew.GoalDistanceProgress, weight=4.0, params={"command_name": "goal_position", "flat_dist": 0.3}
+    )
     fall = RewTerm(func=rew.fall_penalty, weight=-100.0, params={"term_names": ["base_height", "bad_orientation"]})
     at_goal_still = RewTerm(
         func=rew.at_goal_still,

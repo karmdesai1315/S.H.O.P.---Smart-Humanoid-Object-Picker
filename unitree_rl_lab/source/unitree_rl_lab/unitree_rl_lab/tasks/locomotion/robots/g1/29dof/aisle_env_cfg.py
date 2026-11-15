@@ -1,63 +1,126 @@
-"""Unified environment configuration for goal-conditioned G1 walking.
+"""S.H.O.P. environment config: scene, numbers and stage classes, all in one file.
 
-Location:
-    source/unitree_rl_lab/unitree_rl_lab/tasks/locomotion/robots/
-    g1/29dof/aisle_env_cfg.py
+File: source/unitree_rl_lab/unitree_rl_lab/tasks/locomotion/robots/g1/29dof/aisle_env_cfg.py
 
-Stage 1:
-    - Train from scratch on an empty floor.
-    - Sample target XYZ positions.
-    - Walk toward a floor-level goal.
-    - Stop within a 0.5 m radius.
-    - No keyboard velocity commands.
-    - No target heading.
-    - No cameras or aisle assets spawned.
+Nothing here comes from velocity_env_cfg.py. Every function comes from one of our files in mdp/:
+  goal_commands.py      cmd.    goal_position, base_velocity (guide), obstacles
+  goal_observations.py  obs.    what the policy and critic see
+  goal_rewards.py       rew.    Unitree walking rewards + goal rewards
+  goal_terminations.py  done.   time-out and falls
+Events (resets, randomization) and the joint action come from Isaac Lab itself (isaac_mdp.).
 
-Stage 2:
-    - Reuse this file and the same observation/action structure.
-    - Enable the aisle assets.
-    - Add camera-based waypoint planning and apple-target integration.
+Stage 1: flat floor, random goal 0.5-1.5 m away in any direction. Walk there and stand inside the circle.
+  Stage1EnvCfg        training (4096 robots)
+  Stage1PlayEnvCfg    watch it (16 robots, goal markers on)
 
-The aisle scene is defined here but disabled by default during Stage 1.
-Changing enable_aisle alone does not implement Stage 2 navigation.
+The aisle scene (shelves, products, YOLO items, head camera) is in AisleSceneCfg, for later stages.
+
+Robot frame reminder: x forward, y left, z up. The robot starts at its env origin with a random heading.
 """
 
-from __future__ import annotations
-
 import math
-from typing import TYPE_CHECKING
 
-import torch
-
+import isaaclab.envs.mdp as isaac_mdp
 import isaaclab.sim as sim_utils
-from isaaclab.assets import AssetBaseCfg, RigidObjectCfg
+from isaaclab.assets import ArticulationCfg, AssetBaseCfg, RigidObjectCfg
+from isaaclab.envs import ManagerBasedRLEnvCfg
+from isaaclab.managers import EventTermCfg as EventTerm
+from isaaclab.managers import ObservationGroupCfg as ObsGroup
 from isaaclab.managers import ObservationTermCfg as ObsTerm
 from isaaclab.managers import RewardTermCfg as RewTerm
 from isaaclab.managers import SceneEntityCfg
 from isaaclab.managers import TerminationTermCfg as DoneTerm
-from isaaclab.sensors import CameraCfg
+from isaaclab.scene import InteractiveSceneCfg
+from isaaclab.sensors import CameraCfg, ContactSensorCfg
+from isaaclab.terrains import TerrainImporterCfg
 from isaaclab.utils import configclass
-from isaaclab.utils.assets import ISAAC_NUCLEUS_DIR
+from isaaclab.utils.assets import ISAAC_NUCLEUS_DIR, ISAACLAB_NUCLEUS_DIR
+from isaaclab.utils.noise import AdditiveUniformNoiseCfg as Unoise
 
-from unitree_rl_lab.tasks.locomotion import mdp
-
-from .velocity_env_cfg import (
-    ObservationsCfg as WalkingObservationsCfg,
-    RewardsCfg as WalkingRewardsCfg,
-    RobotEnvCfg,
-    RobotSceneCfg,
-    TerminationsCfg as WalkingTerminationsCfg,
-)
-
-if TYPE_CHECKING:
-    from isaaclab.envs import ManagerBasedRLEnv
+from unitree_rl_lab.assets.robots.unitree import UNITREE_G1_29DOF_CFG as ROBOT_CFG
+from unitree_rl_lab.tasks.locomotion.mdp import goal_commands as cmd
+from unitree_rl_lab.tasks.locomotion.mdp import goal_observations as obs
+from unitree_rl_lab.tasks.locomotion.mdp import goal_rewards as rew
+from unitree_rl_lab.tasks.locomotion.mdp import goal_terminations as done
 
 
-# ---------------------------------------------------------------------------
-# Aisle dimensions and appearance.
-# Robot starts facing +X; left shelf is on +Y.
-# ---------------------------------------------------------------------------
+# ===========================================================================
+# Numbers (change things here first)
+# ===========================================================================
+EPISODE_LENGTH_S = 20.0
 
+# goal
+GOAL_DISTANCE_RANGE = (0.5, 1.5)  # m from the start, any direction (your curriculum can change this)
+GOAL_RADIUS = 0.4  # inside = at the goal
+HOLD_RELEASE_RADIUS = 0.5  # stop flag stays on until the robot drifts past this
+TARGET_HEIGHT_RANGE = (0.6, 1.2)  # gripper target height above the floor (m)
+
+# guide velocity (what the walking rewards track)
+GUIDE_MIN_SPEED = 0.2  # m/s, raise to 0.3 if it stalls just outside the circle
+GUIDE_MAX_SPEED = 0.6
+GUIDE_MAX_BACKWARD = 0.3
+GUIDE_MAX_SIDE = 0.3
+GUIDE_MAX_TURN = 0.5  # rad/s
+GUIDE_TURN_MIN_DIST = 0.6  # closer than this: step there without turning
+
+# obstacles
+NUM_OBSTACLE_SLOTS = 4
+
+# observation history (frames) for the robot part; task part is 1 frame
+PROPRIO_HISTORY = 5
+
+# "standing still" for at_goal_still
+STILL_LIN_SPEED = 0.1  # m/s
+STILL_YAW_SPEED = 0.15  # rad/s
+
+# body names used by several rewards
+FEET = ".*ankle_roll.*"
+
+
+# ===========================================================================
+# Scene
+# ===========================================================================
+@configclass
+class ShopSceneCfg(InteractiveSceneCfg):
+    """Flat floor, the G1, contact sensors and a sky light (Stage 1)."""
+
+    terrain = TerrainImporterCfg(
+        prim_path="/World/ground",
+        terrain_type="plane",
+        collision_group=-1,
+        physics_material=sim_utils.RigidBodyMaterialCfg(
+            friction_combine_mode="multiply",
+            restitution_combine_mode="multiply",
+            static_friction=1.0,
+            dynamic_friction=1.0,
+        ),
+        visual_material=sim_utils.MdlFileCfg(
+            mdl_path=f"{ISAACLAB_NUCLEUS_DIR}/Materials/TilesMarbleSpiderWhiteBrickBondHoned/TilesMarbleSpiderWhiteBrickBondHoned.mdl",
+            project_uvw=True,
+            texture_scale=(0.25, 0.25),
+        ),
+        debug_vis=False,
+    )
+
+    # plain G1, 29 body joints (swap in G1_INSPIRE_CFG later for the hands)
+    robot: ArticulationCfg = ROBOT_CFG.replace(prim_path="{ENV_REGEX_NS}/Robot")
+
+    contact_forces = ContactSensorCfg(prim_path="{ENV_REGEX_NS}/Robot/.*", history_length=3, track_air_time=True)
+
+    sky_light = AssetBaseCfg(
+        prim_path="/World/skyLight",
+        spawn=sim_utils.DomeLightCfg(
+            intensity=750.0,
+            texture_file=f"{ISAAC_NUCLEUS_DIR}/Materials/Textures/Skies/PolyHaven/kloofendal_43d_clear_puresky_4k.hdr",
+        ),
+    )
+
+
+# ---- aisle (later stages) -------------------------------------------------
+# Layout from above, robot starts at the origin facing +x:
+#        y ^   [==== left shelf unit ====]   y = +0.70 .. +1.10
+#  robot o-->   aisle (1.4 m wide)            x = 1.0 .. 3.0
+#          |   [==== right shelf unit ===]   y = -0.70 .. -1.10
 AISLE_HALF_WIDTH = 0.70
 SHELF_DEPTH = 0.40
 SHELF_LENGTH = 2.00
@@ -65,87 +128,17 @@ SHELF_CENTER_X = 2.00
 BOARD_THICKNESS = 0.03
 SHELF_HEIGHTS = (0.40, 0.80, 1.10)
 UNIT_HEIGHT = 1.40
-
 SHELF_COLOR = (0.75, 0.75, 0.78)
 PANEL_COLOR = (0.55, 0.55, 0.60)
 TARGET_COLOR = (0.85, 0.20, 0.15)
 
-
-# ---------------------------------------------------------------------------
-# Camera settings.
-# ---------------------------------------------------------------------------
-
-CAMERA_PITCH_DEG = 20.0
+CAMERA_PITCH_DEG = 20.0  # head camera tilt down (real G1 D435 is 47.6)
 _pitch = math.radians(CAMERA_PITCH_DEG)
+CAMERA_ROT = (math.cos(_pitch / 2), 0.0, math.sin(_pitch / 2), 0.0)
 
-CAMERA_ROT = (
-    math.cos(_pitch / 2),
-    0.0,
-    math.sin(_pitch / 2),
-    0.0,
-)
-
-
-# ---------------------------------------------------------------------------
-# Shared goal/stopping settings.
-# ---------------------------------------------------------------------------
-
-GOAL_RADIUS = 0.5
-HOLD_RELEASE_RADIUS = 0.6
-
-LINEAR_STOP_THRESHOLD = 0.08  # m/s
-ANGULAR_STOP_THRESHOLD = 0.10  # rad/s
-SETTLE_TIME_S = 0.5
-
-
-# ---------------------------------------------------------------------------
-# Scene helpers.
-# ---------------------------------------------------------------------------
-
-def static_box(
-    prim_name: str,
-    size: tuple,
-    pos: tuple,
-    color: tuple,
-) -> AssetBaseCfg:
-    """Create a fixed collidable box."""
-    return AssetBaseCfg(
-        prim_path="{ENV_REGEX_NS}/Aisle_" + prim_name,
-        spawn=sim_utils.CuboidCfg(
-            size=size,
-            collision_props=sim_utils.CollisionPropertiesCfg(),
-            visual_material=sim_utils.PreviewSurfaceCfg(
-                diffuse_color=color,
-            ),
-        ),
-        init_state=AssetBaseCfg.InitialStateCfg(pos=pos),
-    )
-
-
-def board(side: int, level: int) -> AssetBaseCfg:
-    """Create one horizontal shelf board."""
-    y = side * (AISLE_HALF_WIDTH + SHELF_DEPTH / 2)
-    name = f"{'left' if side > 0 else 'right'}_board_{level}"
-
-    return static_box(
-        name,
-        size=(SHELF_LENGTH, SHELF_DEPTH, BOARD_THICKNESS),
-        pos=(SHELF_CENTER_X, y, SHELF_HEIGHTS[level]),
-        color=SHELF_COLOR,
-    )
-
-
-def back_panel(side: int) -> AssetBaseCfg:
-    """Create a shelf back panel."""
-    y = side * (AISLE_HALF_WIDTH + SHELF_DEPTH + 0.01)
-    name = f"{'left' if side > 0 else 'right'}_back_panel"
-
-    return static_box(
-        name,
-        size=(SHELF_LENGTH, 0.02, UNIT_HEIGHT),
-        pos=(SHELF_CENTER_X, y, UNIT_HEIGHT / 2),
-        color=PANEL_COLOR,
-    )
+YCB_DIR = f"{ISAAC_NUCLEUS_DIR}/Props/YCB/Axis_Aligned_Physics"  # products with physics
+YCB_VISUAL_DIR = f"{ISAAC_NUCLEUS_DIR}/Props/YCB/Axis_Aligned"  # fixed props YOLO can recognise
+PROP_ORIGIN_AT_CENTER = True  # if props float or sink into the shelf, flip this
 
 
 def shelf_top(level: int) -> float:
@@ -153,46 +146,59 @@ def shelf_top(level: int) -> float:
 
 
 APPLE_RADIUS = 0.04
-APPLE_LEVEL = 1
-
-APPLE_POS = (
-    SHELF_CENTER_X,
-    AISLE_HALF_WIDTH + 0.10,
-    shelf_top(APPLE_LEVEL) + APPLE_RADIUS + 0.005,
-)
-
-YCB_DIR = f"{ISAAC_NUCLEUS_DIR}/Props/YCB/Axis_Aligned_Physics"
+APPLE_POS = (SHELF_CENTER_X, AISLE_HALF_WIDTH + 0.10, shelf_top(1) + APPLE_RADIUS + 0.005)
 
 
-def grocery_item(
-    name: str,
-    usd_file: str,
-    side: int,
-    level: int,
-    x: float,
-) -> RigidObjectCfg:
-    """Create a grocery product slightly above its shelf."""
-    y = side * (AISLE_HALF_WIDTH + 0.12)
-
-    return RigidObjectCfg(
-        prim_path="{ENV_REGEX_NS}/" + name,
-        spawn=sim_utils.UsdFileCfg(
-            usd_path=f"{YCB_DIR}/{usd_file}",
+def static_box(prim_name: str, size: tuple, pos: tuple, color: tuple) -> AssetBaseCfg:
+    """A fixed box the robot can bump into."""
+    return AssetBaseCfg(
+        prim_path="{ENV_REGEX_NS}/Aisle_" + prim_name,
+        spawn=sim_utils.CuboidCfg(
+            size=size,
+            collision_props=sim_utils.CollisionPropertiesCfg(),
+            visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=color),
         ),
-        init_state=RigidObjectCfg.InitialStateCfg(
-            pos=(x, y, shelf_top(level) + 0.12),
-        ),
+        init_state=AssetBaseCfg.InitialStateCfg(pos=pos),
     )
 
 
-# ---------------------------------------------------------------------------
-# Full aisle scene.
-# Optional assets are removed from the scene config for Stage 1.
-# ---------------------------------------------------------------------------
+def board(side: int, level: int) -> AssetBaseCfg:
+    """One shelf board. side = +1 left, -1 right."""
+    y = side * (AISLE_HALF_WIDTH + SHELF_DEPTH / 2)
+    name = f"{'left' if side > 0 else 'right'}_board_{level}"
+    return static_box(name, (SHELF_LENGTH, SHELF_DEPTH, BOARD_THICKNESS), (SHELF_CENTER_X, y, SHELF_HEIGHTS[level]), SHELF_COLOR)
+
+
+def back_panel(side: int) -> AssetBaseCfg:
+    y = side * (AISLE_HALF_WIDTH + SHELF_DEPTH + 0.01)
+    name = f"{'left' if side > 0 else 'right'}_back_panel"
+    return static_box(name, (SHELF_LENGTH, 0.02, UNIT_HEIGHT), (SHELF_CENTER_X, y, UNIT_HEIGHT / 2), PANEL_COLOR)
+
+
+def grocery_item(name: str, usd_file: str, side: int, level: int, x: float) -> RigidObjectCfg:
+    """A YCB product with physics, dropped just above the shelf."""
+    y = side * (AISLE_HALF_WIDTH + 0.12)
+    return RigidObjectCfg(
+        prim_path="{ENV_REGEX_NS}/" + name,
+        spawn=sim_utils.UsdFileCfg(usd_path=f"{YCB_DIR}/{usd_file}"),
+        init_state=RigidObjectCfg.InitialStateCfg(pos=(x, y, shelf_top(level) + 0.12)),
+    )
+
+
+def shelf_prop(name: str, usd_file: str, side: int, level: int, x: float, height: float) -> AssetBaseCfg:
+    """A fixed (no physics) YCB item standing on a shelf. height = item height (m)."""
+    y = side * (AISLE_HALF_WIDTH + 0.12)
+    z = shelf_top(level) + (height / 2 if PROP_ORIGIN_AT_CENTER else 0.0) + 0.002
+    return AssetBaseCfg(
+        prim_path="{ENV_REGEX_NS}/" + name,
+        spawn=sim_utils.UsdFileCfg(usd_path=f"{YCB_VISUAL_DIR}/{usd_file}"),
+        init_state=AssetBaseCfg.InitialStateCfg(pos=(x, y, z)),
+    )
+
 
 @configclass
-class AisleSceneCfg(RobotSceneCfg):
-    """Robot scene with shelves, grocery objects, and a head RGB-D camera."""
+class AisleSceneCfg(ShopSceneCfg):
+    """Stage 1 scene + shelves, products, YOLO items and the head camera (run with --enable_cameras)."""
 
     head_camera = CameraCfg(
         prim_path="{ENV_REGEX_NS}/Robot/torso_link/head_camera",
@@ -200,23 +206,14 @@ class AisleSceneCfg(RobotSceneCfg):
         height=480,
         width=640,
         data_types=["rgb", "distance_to_image_plane"],
-        spawn=sim_utils.PinholeCameraCfg(
-            focal_length=15.2,
-            horizontal_aperture=20.955,
-            clipping_range=(0.1, 20.0),
-        ),
-        offset=CameraCfg.OffsetCfg(
-            pos=(0.0576, 0.0175, 0.4299),
-            rot=CAMERA_ROT,
-            convention="world",
-        ),
+        spawn=sim_utils.PinholeCameraCfg(focal_length=15.2, horizontal_aperture=20.955, clipping_range=(0.1, 20.0)),
+        offset=CameraCfg.OffsetCfg(pos=(0.0576, 0.0175, 0.4299), rot=CAMERA_ROT, convention="world"),
     )
 
     left_board_0 = board(+1, 0)
     left_board_1 = board(+1, 1)
     left_board_2 = board(+1, 2)
     left_back_panel = back_panel(+1)
-
     right_board_0 = board(-1, 0)
     right_board_1 = board(-1, 1)
     right_board_2 = board(-1, 2)
@@ -229,425 +226,303 @@ class AisleSceneCfg(RobotSceneCfg):
             rigid_props=sim_utils.RigidBodyPropertiesCfg(),
             mass_props=sim_utils.MassPropertiesCfg(mass=0.2),
             collision_props=sim_utils.CollisionPropertiesCfg(),
-            visual_material=sim_utils.PreviewSurfaceCfg(
-                diffuse_color=TARGET_COLOR,
-            ),
-            physics_material=sim_utils.RigidBodyMaterialCfg(
-                static_friction=1.0,
-                dynamic_friction=1.0,
-            ),
+            visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=TARGET_COLOR),
+            physics_material=sim_utils.RigidBodyMaterialCfg(static_friction=1.0, dynamic_friction=1.0),
         ),
-        init_state=RigidObjectCfg.InitialStateCfg(
-            pos=APPLE_POS,
-        ),
+        init_state=RigidObjectCfg.InitialStateCfg(pos=APPLE_POS),
     )
 
-    cracker_box = grocery_item(
-        "CrackerBox",
-        "003_cracker_box.usd",
-        side=+1,
-        level=1,
-        x=1.5,
-    )
+    cracker_box = grocery_item("CrackerBox", "003_cracker_box.usd", side=+1, level=1, x=1.5)
+    sugar_box = grocery_item("SugarBox", "004_sugar_box.usd", side=+1, level=0, x=2.3)
+    soup_can = grocery_item("SoupCan", "005_tomato_soup_can.usd", side=-1, level=1, x=1.8)
+    mustard = grocery_item("Mustard", "006_mustard_bottle.usd", side=-1, level=2, x=2.4)
 
-    sugar_box = grocery_item(
-        "SugarBox",
-        "004_sugar_box.usd",
-        side=+1,
-        level=0,
-        x=2.3,
-    )
-
-    soup_can = grocery_item(
-        "SoupCan",
-        "005_tomato_soup_can.usd",
-        side=-1,
-        level=1,
-        x=1.8,
-    )
-
-    mustard = grocery_item(
-        "Mustard",
-        "006_mustard_bottle.usd",
-        side=-1,
-        level=2,
-        x=2.4,
-    )
+    banana = shelf_prop("Banana", "011_banana.usd", side=+1, level=1, x=2.5, height=0.04)
+    mug_left = shelf_prop("MugLeft", "025_mug.usd", side=+1, level=0, x=1.5, height=0.08)
+    bowl = shelf_prop("Bowl", "024_bowl.usd", side=+1, level=2, x=2.0, height=0.055)
+    bleach = shelf_prop("Bleach", "021_bleach_cleanser.usd", side=-1, level=1, x=2.4, height=0.25)
+    mug_right = shelf_prop("MugRight", "025_mug.usd", side=-1, level=1, x=1.3, height=0.08)
 
 
-# ---------------------------------------------------------------------------
-# Goal-aware walking reward helpers.
-# ---------------------------------------------------------------------------
-
-def goal_gait_reward(
-    env: ManagerBasedRLEnv,
-    sensor_cfg: SceneEntityCfg,
-    command_name: str = "goal_position",
-) -> torch.Tensor:
-    """Encourage stepping during travel and both feet down during hold."""
-    term = env.command_manager.get_term(command_name)
-
-    # Disable the original velocity-command gate.
-    walking_reward = mdp.feet_gait(
-        env,
-        period=0.8,
-        offset=[0.0, 0.5],
-        threshold=0.55,
-        sensor_cfg=sensor_cfg,
-        command_name=None,
-    )
-
-    sensor = env.scene.sensors[sensor_cfg.name]
-    contacts = (
-        sensor.data.current_contact_time[:, sensor_cfg.body_ids] > 0.0
-    )
-
-    # Match the maximum two-foot gait reward scale.
-    standing_reward = contacts.all(dim=-1).float() * 2.0
-
-    # Include live distance because rewards precede command refresh.
-    should_hold = (
-        term.goal_distance_xy <= term.cfg.goal_radius
-    ) | term.hold_position
-
-    return torch.where(
-        should_hold,
-        standing_reward,
-        walking_reward,
-    )
-
-
-def successful_goal_event(
-    env: ManagerBasedRLEnv,
-) -> torch.Tensor:
-    """Completion event, excluding simultaneous fall terminations."""
-    manager = env.termination_manager
-
-    success = manager.get_term("goal_reached")
-    fallen = (
-        manager.get_term("base_height")
-        | manager.get_term("bad_orientation")
-    )
-
-    # RewardManager multiplies by step_dt. Dividing here makes the
-    # configured reward weight an actual once-per-episode event bonus.
-    return (success & ~fallen).float() / env.step_dt
-
-
-def falling_event(
-    env: ManagerBasedRLEnv,
-) -> torch.Tensor:
-    """Fall event, excluding timeouts and ordinary goal completion."""
-    manager = env.termination_manager
-
-    fallen = (
-        manager.get_term("base_height")
-        | manager.get_term("bad_orientation")
-    )
-
-    return fallen.float() / env.step_dt
-
-
-# ---------------------------------------------------------------------------
-# Goal commands.
-# ---------------------------------------------------------------------------
-
+# ===========================================================================
+# Commands (order matters: base_velocity reads goal_position)
+# ===========================================================================
 @configclass
-class GoalCommandsCfg:
-    goal_position = mdp.GoalPositionCommandCfg(
-        asset_name="robot",
-        distance_range=(0.75, 1.25),
-        target_height_range=(0.6, 1.2),
-        floor_height=0.0,
+class CommandsCfg:
+    goal_position = cmd.GoalPositionCommandCfg(
+        distance_range=GOAL_DISTANCE_RANGE,
+        target_height_range=TARGET_HEIGHT_RANGE,
         goal_radius=GOAL_RADIUS,
         hold_release_radius=HOLD_RELEASE_RADIUS,
-        resampling_time_range=(1.0e9, 1.0e9),
         debug_vis=False,
     )
+    base_velocity = cmd.GuideVelocityCommandCfg(
+        goal_command_name="goal_position",
+        min_speed=GUIDE_MIN_SPEED,
+        max_speed=GUIDE_MAX_SPEED,
+        max_forward=GUIDE_MAX_SPEED,
+        max_backward=GUIDE_MAX_BACKWARD,
+        max_side=GUIDE_MAX_SIDE,
+        max_turn=GUIDE_MAX_TURN,
+        turn_min_dist=GUIDE_TURN_MIN_DIST,
+    )
+    obstacles = cmd.ObstacleCommandCfg(num_slots=NUM_OBSTACLE_SLOTS)
 
 
-# ---------------------------------------------------------------------------
-# Observations.
-#
-# Inherit robot observations from the original walking configuration.
-# Remove velocity commands and add goal/waypoint observations.
-# Keep this layout unchanged when proceeding to Stage 2.
-# ---------------------------------------------------------------------------
-
+# ===========================================================================
+# Actions: all 29 joints, target = default + 0.25 * action (same as Unitree)
+# ===========================================================================
 @configclass
-class GoalPolicyObservationsCfg(WalkingObservationsCfg.PolicyCfg):
-    velocity_commands = None
-
-    base_velocity_xy = ObsTerm(
-        func=mdp.base_linear_velocity_xy,
-        scale=1.0,
+class ActionsCfg:
+    JointPositionAction = isaac_mdp.JointPositionActionCfg(
+        asset_name="robot", joint_names=[".*"], scale=0.25, use_default_offset=True
     )
 
-    waypoint_xy = ObsTerm(
-        func=mdp.local_waypoint_xy,
-        params={"command_name": "goal_position"},
-        scale=0.5,
-    )
 
-    target_xyz = ObsTerm(
-        func=mdp.target_position_xyz,
-        params={"command_name": "goal_position"},
-        scale=0.5,
-    )
-
-    hold_position = ObsTerm(
-        func=mdp.hold_position_observation,
-        params={"command_name": "goal_position"},
-    )
-
-    def __post_init__(self):
-        super().__post_init__()
-        self.history_length = 5
-        self.flatten_history_dim = True
-        self.concatenate_terms = True
-        self.enable_corruption = True
-
-
+# ===========================================================================
+# Observations (fixed for all stages, see goal_observations.py)
+# ===========================================================================
 @configclass
-class GoalCriticObservationsCfg(GoalPolicyObservationsCfg):
-    """Same observation layout as the actor, without observation noise."""
+class ObservationsCfg:
+    @configclass
+    class PolicyCfg(ObsGroup):
+        # robot: PROPRIO_HISTORY frames each
+        base_ang_vel = ObsTerm(func=obs.base_ang_vel, scale=0.2, noise=Unoise(n_min=-0.2, n_max=0.2), history_length=PROPRIO_HISTORY)
+        projected_gravity = ObsTerm(func=obs.projected_gravity, noise=Unoise(n_min=-0.05, n_max=0.05), history_length=PROPRIO_HISTORY)
+        joint_pos_rel = ObsTerm(func=obs.joint_pos_rel, noise=Unoise(n_min=-0.01, n_max=0.01), history_length=PROPRIO_HISTORY)
+        joint_vel_rel = ObsTerm(func=obs.joint_vel_rel, scale=0.05, noise=Unoise(n_min=-1.5, n_max=1.5), history_length=PROPRIO_HISTORY)
+        last_action = ObsTerm(func=obs.last_action, history_length=PROPRIO_HISTORY)
+        # task: 1 frame
+        goal_xy = ObsTerm(func=obs.goal_xy, params={"command_name": "goal_position"})
+        waypoint_xy = ObsTerm(func=obs.waypoint_xy, params={"command_name": "goal_position"})
+        target_pos = ObsTerm(func=obs.target_pos, params={"command_name": "goal_position"})
+        target_quat = ObsTerm(func=obs.target_quat, params={"command_name": "goal_position"})
+        hold_flag = ObsTerm(func=obs.hold_flag, params={"command_name": "goal_position"})
+        obstacle_slots = ObsTerm(func=obs.obstacle_slots, params={"command_name": "obstacles"})
 
-    def __post_init__(self):
-        super().__post_init__()
-        self.enable_corruption = False
+        def __post_init__(self):
+            self.history_length = None  # None = each term uses its own history_length
+            self.enable_corruption = True
+            self.concatenate_terms = True
+
+    @configclass
+    class CriticCfg(ObsGroup):
+        # same as the policy, no noise ...
+        base_ang_vel = ObsTerm(func=obs.base_ang_vel, scale=0.2, history_length=PROPRIO_HISTORY)
+        projected_gravity = ObsTerm(func=obs.projected_gravity, history_length=PROPRIO_HISTORY)
+        joint_pos_rel = ObsTerm(func=obs.joint_pos_rel, history_length=PROPRIO_HISTORY)
+        joint_vel_rel = ObsTerm(func=obs.joint_vel_rel, scale=0.05, history_length=PROPRIO_HISTORY)
+        last_action = ObsTerm(func=obs.last_action, history_length=PROPRIO_HISTORY)
+        goal_xy = ObsTerm(func=obs.goal_xy, params={"command_name": "goal_position"})
+        waypoint_xy = ObsTerm(func=obs.waypoint_xy, params={"command_name": "goal_position"})
+        target_pos = ObsTerm(func=obs.target_pos, params={"command_name": "goal_position"})
+        target_quat = ObsTerm(func=obs.target_quat, params={"command_name": "goal_position"})
+        hold_flag = ObsTerm(func=obs.hold_flag, params={"command_name": "goal_position"})
+        obstacle_slots = ObsTerm(func=obs.obstacle_slots, params={"command_name": "obstacles"})
+        # ... plus simulation-only extras
+        base_lin_vel = ObsTerm(func=obs.base_lin_vel, history_length=PROPRIO_HISTORY)
+        guide_velocity = ObsTerm(func=obs.guide_velocity, params={"command_name": "base_velocity"})
+        goal_distance = ObsTerm(func=obs.goal_distance, params={"command_name": "goal_position"})
+
+        def __post_init__(self):
+            self.history_length = None
+            self.enable_corruption = False
+            self.concatenate_terms = True
+
+    policy: PolicyCfg = PolicyCfg()
+    critic: CriticCfg = CriticCfg()
 
 
+# ===========================================================================
+# Rewards (weights are multiplied by step_dt = 0.02 inside Isaac Lab)
+# ===========================================================================
 @configclass
-class GoalObservationsCfg:
-    policy: GoalPolicyObservationsCfg = GoalPolicyObservationsCfg()
-    critic: GoalCriticObservationsCfg = GoalCriticObservationsCfg()
+class RewardsCfg:
+    # -- walking: track the guide velocity (Unitree weights)
+    track_lin_vel_xy = RewTerm(
+        func=rew.track_lin_vel_xy_yaw_frame_exp, weight=2.0, params={"command_name": "base_velocity", "std": math.sqrt(0.25)}
+    )
+    track_ang_vel_z = RewTerm(
+        func=rew.track_ang_vel_z_exp, weight=1.0, params={"command_name": "base_velocity", "std": math.sqrt(0.25)}
+    )
+    alive = RewTerm(func=rew.is_alive, weight=0.15)
 
+    # -- base
+    base_linear_velocity = RewTerm(func=rew.lin_vel_z_l2, weight=-2.0)
+    base_angular_velocity = RewTerm(func=rew.ang_vel_xy_l2, weight=-0.05)
+    flat_orientation_l2 = RewTerm(func=rew.flat_orientation_l2, weight=-5.0)
+    base_height = RewTerm(func=rew.base_height_l2, weight=-10.0, params={"target_height": 0.78})
 
-# ---------------------------------------------------------------------------
-# Rewards.
-# ---------------------------------------------------------------------------
-
-@configclass
-class GoalRewardsCfg(WalkingRewardsCfg):
-    # Remove rewards requiring a velocity-command generator.
-    track_lin_vel_xy = None
-    track_ang_vel_z = None
-
-    goal_distance_and_stop = RewTerm(
-        func=mdp.goal_distance_and_stop_reward,
-        weight=2.0,
-        params={
-            "command_name": "goal_position",
-            "linear_speed_threshold": LINEAR_STOP_THRESHOLD,
-            "angular_speed_threshold": ANGULAR_STOP_THRESHOLD,
-        },
+    # -- joints
+    joint_vel = RewTerm(func=rew.joint_vel_l2, weight=-0.001)
+    joint_acc = RewTerm(func=rew.joint_acc_l2, weight=-2.5e-7)
+    action_rate = RewTerm(func=rew.action_rate_l2, weight=-0.05)
+    dof_pos_limits = RewTerm(func=rew.joint_pos_limits, weight=-5.0)
+    energy = RewTerm(func=rew.energy, weight=-2e-5)
+    joint_deviation_arms = RewTerm(
+        func=rew.joint_deviation_l1,
+        weight=-0.1,
+        params={"asset_cfg": SceneEntityCfg("robot", joint_names=[".*_shoulder_.*_joint", ".*_elbow_joint", ".*_wrist_.*"])},
+    )
+    joint_deviation_waists = RewTerm(
+        func=rew.joint_deviation_l1, weight=-1.0, params={"asset_cfg": SceneEntityCfg("robot", joint_names=["waist.*"])}
+    )
+    joint_deviation_legs = RewTerm(
+        func=rew.joint_deviation_l1,
+        weight=-1.0,
+        params={"asset_cfg": SceneEntityCfg("robot", joint_names=[".*_hip_roll_joint", ".*_hip_yaw_joint"])},
     )
 
-    motion_at_goal = RewTerm(
-        func=mdp.motion_inside_goal_penalty,
-        weight=-2.0,
-        params={
-            "command_name": "goal_position",
-            "angular_weight": 0.25,
-        },
-    )
-
-    goal_completion = RewTerm(
-        func=successful_goal_event,
-        weight=60.0,
-    )
-
-    fall = RewTerm(
-        func=falling_event,
-        weight=-5.0,
-    )
-
-    # Replace the original base_velocity-dependent gait reward.
+    # -- feet
     gait = RewTerm(
-        func=goal_gait_reward,
-        weight=0.2,
+        func=rew.feet_gait,
+        weight=0.5,
         params={
-            "command_name": "goal_position",
-            "sensor_cfg": SceneEntityCfg(
-                "contact_forces",
-                body_names=".*ankle_roll.*",
-            ),
+            "period": 0.8,
+            "offset": [0.0, 0.5],
+            "threshold": 0.55,
+            "command_name": "base_velocity",
+            "sensor_cfg": SceneEntityCfg("contact_forces", body_names=FEET),
+        },
+    )
+    feet_slide = RewTerm(
+        func=rew.feet_slide,
+        weight=-0.2,
+        params={
+            "asset_cfg": SceneEntityCfg("robot", body_names=FEET),
+            "sensor_cfg": SceneEntityCfg("contact_forces", body_names=FEET),
+        },
+    )
+    feet_clearance = RewTerm(
+        func=rew.foot_clearance_reward,
+        weight=1.0,
+        params={
+            "std": 0.05,
+            "tanh_mult": 2.0,
+            "target_height": 0.1,
+            "command_name": "base_velocity",  # only pays while the guide says walk
+            "asset_cfg": SceneEntityCfg("robot", body_names=FEET),
+        },
+    )
+    undesired_contacts = RewTerm(
+        func=rew.undesired_contacts,
+        weight=-1.0,
+        params={"threshold": 1.0, "sensor_cfg": SceneEntityCfg("contact_forces", body_names=["(?!.*ankle.*).*"])},
+    )
+
+    # -- goal (on top of walking)
+    fall = RewTerm(func=rew.fall_penalty, weight=-100.0, params={"term_names": ["base_height", "bad_orientation"]})
+    at_goal_still = RewTerm(
+        func=rew.at_goal_still,
+        weight=1.0,
+        params={"command_name": "goal_position", "lin_speed_max": STILL_LIN_SPEED, "yaw_speed_max": STILL_YAW_SPEED},
+    )
+
+
+# ===========================================================================
+# Terminations (reaching the goal does NOT end the episode in Stage 1)
+# ===========================================================================
+@configclass
+class TerminationsCfg:
+    time_out = DoneTerm(func=done.time_out, time_out=True)
+    base_height = DoneTerm(func=done.root_height_below_minimum, params={"minimum_height": 0.2})
+    bad_orientation = DoneTerm(func=done.bad_orientation, params={"limit_angle": 0.8})
+
+
+# ===========================================================================
+# Events
+# ===========================================================================
+@configclass
+class EventsCfg:
+    # startup: floor friction per body
+    physics_material = EventTerm(
+        func=isaac_mdp.randomize_rigid_body_material,
+        mode="startup",
+        params={
+            "asset_cfg": SceneEntityCfg("robot", body_names=".*"),
+            "static_friction_range": (0.6, 1.0),
+            "dynamic_friction_range": (0.6, 1.0),
+            "restitution_range": (0.0, 0.0),
+            "num_buckets": 64,
         },
     )
 
-
-# ---------------------------------------------------------------------------
-# Terminations.
-# ---------------------------------------------------------------------------
-
-@configclass
-class GoalTerminationsCfg(WalkingTerminationsCfg):
-    # Inherited fall checks:
-    #   base_height
-    #   bad_orientation
-
-    # Replace the inherited timeout.
-    time_out = DoneTerm(
-        func=mdp.goal_timeout,
-        time_out=True,
-        params={"timeout_s": 20.0},
-    )
-
-    goal_reached = DoneTerm(
-        func=mdp.GoalReached,
-        time_out=False,
+    # reset: at the env origin, random heading, default joint pose with a little joint speed
+    reset_base = EventTerm(
+        func=isaac_mdp.reset_root_state_uniform,
+        mode="reset",
         params={
-            "command_name": "goal_position",
-            "linear_speed_threshold": LINEAR_STOP_THRESHOLD,
-            "angular_speed_threshold": ANGULAR_STOP_THRESHOLD,
-            "settle_time_s": SETTLE_TIME_S,
+            "pose_range": {"x": (0.0, 0.0), "y": (0.0, 0.0), "yaw": (-math.pi, math.pi)},
+            "velocity_range": {
+                "x": (0.0, 0.0),
+                "y": (0.0, 0.0),
+                "z": (0.0, 0.0),
+                "roll": (0.0, 0.0),
+                "pitch": (0.0, 0.0),
+                "yaw": (0.0, 0.0),
+            },
         },
     )
+    reset_robot_joints = EventTerm(
+        func=isaac_mdp.reset_joints_by_scale,
+        mode="reset",
+        params={"position_range": (1.0, 1.0), "velocity_range": (-0.1, 0.1)},
+    )
+    # no pushes and no extra torso mass in Stage 1 (add them back once it walks to goals)
 
 
-# ---------------------------------------------------------------------------
-# Curriculum.
-# ---------------------------------------------------------------------------
-
+# ===========================================================================
+# Curriculum (you're writing this one; register terms here)
+# ===========================================================================
 @configclass
-class GoalCurriculumCfg:
-    """No terrain or velocity-command curriculum.
-
-    Start with nearby goals. A success-based goal-distance curriculum
-    can be added after basic walking and stopping have been verified.
-    """
-
+class CurriculumCfg:
     pass
 
 
-# ---------------------------------------------------------------------------
-# Unified training environment.
-# ---------------------------------------------------------------------------
-
+# ===========================================================================
+# Stage 1
+# ===========================================================================
 @configclass
-class AisleEnvCfg(RobotEnvCfg):
-    """Goal-conditioned walking environment.
+class Stage1EnvCfg(ManagerBasedRLEnvCfg):
+    """Training: walk to a random goal 0.5-1.5 m away on a flat floor, then stand in the circle."""
 
-    Stage 1 uses sampled numerical targets on an empty floor.
-    The shelf apple is not the Stage 1 target.
-
-    Aisle assets remain defined in this file for Stage 2.
-    """
-
-    enable_aisle: bool = False
-
-    scene: AisleSceneCfg = AisleSceneCfg(
-        num_envs=4096,
-        env_spacing=5.0,
-    )
-
-    commands: GoalCommandsCfg = GoalCommandsCfg()
-    observations: GoalObservationsCfg = GoalObservationsCfg()
-    rewards: GoalRewardsCfg = GoalRewardsCfg()
-    terminations: GoalTerminationsCfg = GoalTerminationsCfg()
-    curriculum: GoalCurriculumCfg = GoalCurriculumCfg()
+    scene: ShopSceneCfg = ShopSceneCfg(num_envs=4096, env_spacing=2.5)
+    commands: CommandsCfg = CommandsCfg()
+    actions: ActionsCfg = ActionsCfg()
+    observations: ObservationsCfg = ObservationsCfg()
+    rewards: RewardsCfg = RewardsCfg()
+    terminations: TerminationsCfg = TerminationsCfg()
+    events: EventsCfg = EventsCfg()
+    curriculum: CurriculumCfg = CurriculumCfg()
 
     def __post_init__(self):
-        # Scene configs are edited before the actual scene is constructed.
-        # Stage 1 does not spawn shelves, products, apple, or camera.
-        if not self.enable_aisle:
-            for name in (
-                "left_board_0",
-                "left_board_1",
-                "left_board_2",
-                "left_back_panel",
-                "right_board_0",
-                "right_board_1",
-                "right_board_2",
-                "right_back_panel",
-                "target_object",
-                "cracker_box",
-                "sugar_box",
-                "soup_can",
-                "mustard",
-                "head_camera",
-            ):
-                setattr(self.scene, name, None)
+        # timing: physics 200 Hz, policy 50 Hz (same as Unitree)
+        self.decimation = 4
+        self.episode_length_s = EPISODE_LENGTH_S
+        self.sim.dt = 0.005
+        self.sim.render_interval = self.decimation
+        self.sim.physics_material = self.scene.terrain.physics_material
+        self.sim.physx.gpu_max_rigid_patch_count = 10 * 2**15
+        self.scene.contact_forces.update_period = self.sim.dt
 
-        super().__post_init__()
-
-        # Flat floor.
-        self.scene.terrain.terrain_type = "plane"
-        self.scene.terrain.terrain_generator = None
-        self.scene.terrain.max_init_terrain_level = None
-
-        # Keep episode and goal timeout settings consistent.
-        self.episode_length_s = 20.0
-        self.terminations.time_out.params["timeout_s"] = (
-            self.episode_length_s
-        )
-
-        # Simplify learning from scratch.
-        self.events.push_robot = None
-        self.events.add_base_mass = None
-
-        self.events.physics_material.params["static_friction_range"] = (
-            0.6, 1.0
-        )
-        self.events.physics_material.params["dynamic_friction_range"] = (
-            0.6, 1.0
-        )
-
-        # Fixed XY start with varied yaw.
-        # No desired heading is included in the observations.
-        self.events.reset_base.params["pose_range"] = {
-            "x": (0.0, 0.0),
-            "y": (0.0, 0.0),
-            "yaw": (-math.pi, math.pi),
-        }
-
-        self.events.reset_robot_joints.params["velocity_range"] = (
-            -0.1, 0.1
-        )
-
-        # Starting weights for inherited walking rewards.
-        self.rewards.alive.weight = 0.05
-
-        # Body stability and limits.
-        self.rewards.base_linear_velocity.weight = -2.0
-        self.rewards.base_angular_velocity.weight = -0.05
-        self.rewards.flat_orientation_l2.weight = -5.0
-        self.rewards.base_height.weight = -10.0
-        self.rewards.dof_pos_limits.weight = -5.0
-
-        # Motion regularization.
-        self.rewards.joint_vel.weight = -0.0002
-        self.rewards.joint_acc.weight = -2.5e-7
-        self.rewards.action_rate.weight = -0.02
-        self.rewards.energy.weight = -2e-5
-
-        # Posture.
-        self.rewards.joint_deviation_arms.weight = -0.1
-        self.rewards.joint_deviation_waists.weight = -0.5
-        self.rewards.joint_deviation_legs.weight = -0.3
-
-        # Feet and non-foot contacts.
-        self.rewards.feet_slide.weight = -0.2
-        self.rewards.feet_clearance.weight = 0.2
-        self.rewards.undesired_contacts.weight = -1.0
-
-
-# ---------------------------------------------------------------------------
-# Playback configuration, in the same file.
-# ---------------------------------------------------------------------------
 
 @configclass
-class AislePlayEnvCfg(AisleEnvCfg):
-    """Single-environment playback of the goal-conditioned policy."""
+class Stage1PlayEnvCfg(Stage1EnvCfg):
+    """Watch Stage 1: a few robots, goal markers on (green ball = goal, small frame = gripper target)."""
 
     def __post_init__(self):
         super().__post_init__()
-
-        self.scene.num_envs = 1
+        self.scene.num_envs = 16
+        self.scene.env_spacing = 4.0
         self.observations.policy.enable_corruption = False
-
+        self.commands.goal_position.debug_vis = True
         self.viewer.origin_type = "asset_root"
         self.viewer.asset_name = "robot"
         self.viewer.env_index = 0
         self.viewer.eye = (3.0, 3.0, 2.0)
         self.viewer.lookat = (0.0, 0.0, 0.5)
+
+
+# old names, so the current task registration (Unitree-G1-29dof-Aisle) keeps working
+AisleEnvCfg = Stage1EnvCfg
+AislePlayEnvCfg = Stage1PlayEnvCfg

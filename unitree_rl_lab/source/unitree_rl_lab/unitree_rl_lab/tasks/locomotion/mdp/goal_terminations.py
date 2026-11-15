@@ -1,9 +1,24 @@
-"""Termination conditions for goal-conditioned G1 walking.
+"""Termination functions for the S.H.O.P. goal-walking task (all stages).
 
-Success uses the final floor-level walking goal, not the target's height
-or an intermediate waypoint.
+File: source/unitree_rl_lab/unitree_rl_lab/tasks/locomotion/mdp/goal_terminations.py
 
-Speed thresholds should match those used in goal_rewards.py.
+Stage 1 terminations (names used in aisle_env_cfg.py; fall_penalty in goal_rewards.py reads the last two):
+  time_out          episode time is up (20 s)            -> time_out=True (not a failure, PPO bootstraps)
+  base_height       pelvis below 0.2 m                   -> fell
+  bad_orientation   tilted more than 0.8 rad (~46 deg)   -> fell
+
+Reaching the goal does NOT end the episode in Stage 1. The robot walks in and keeps standing there until
+the time-out, because standing at the goal pays the most reward per step. Ending early would throw that
+away, and the policy would learn to never quite settle.
+Success is logged instead: Metrics/goal_position/inside_goal = fraction of robots inside the goal circle
+when their episode ended (shown in the terminal and W&B).
+
+GoalReached (Akanksh's "inside the circle and settled for 0.5 s") is kept for later stages, e.g. when
+reaching the goal should hand over to grasping. It is NOT in the Stage 1 terminations list.
+If it is used later, give the success a big enough bonus to beat the reward the robot would have kept
+collecting by staying (see the note in goal_rewards.py).
+
+goal_timeout is gone: time_out with episode_length_s = 20 does the same thing.
 """
 
 from __future__ import annotations
@@ -14,131 +29,80 @@ from typing import TYPE_CHECKING
 
 import torch
 
-from isaaclab.managers import ManagerTermBase, TerminationTermCfg
+from isaaclab.assets import Articulation
+from isaaclab.managers import ManagerTermBase, SceneEntityCfg, TerminationTermCfg
 
 if TYPE_CHECKING:
     from isaaclab.envs import ManagerBasedRLEnv
 
 
-class GoalReached(ManagerTermBase):
-    """Succeed after remaining inside the goal and nearly stationary.
+# ===========================================================================
+# Stage 1
+# ===========================================================================
+def time_out(env: ManagerBasedRLEnv) -> torch.Tensor:
+    """Episode length reached. Register with time_out=True."""
+    return env.episode_length_buf >= env.max_episode_length
 
-    The termination manager calls this once per environment step.
-    Per-environment counters are cleared on episode reset and whenever
-    a new goal command is sampled.
+
+def root_height_below_minimum(
+    env: ManagerBasedRLEnv, minimum_height: float, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")
+) -> torch.Tensor:
+    """Pelvis dropped below minimum_height (m): the robot fell."""
+    robot: Articulation = env.scene[asset_cfg.name]
+    return robot.data.root_pos_w[:, 2] < minimum_height
+
+
+def bad_orientation(
+    env: ManagerBasedRLEnv, limit_angle: float, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")
+) -> torch.Tensor:
+    """Body tilted more than limit_angle (rad) from upright: the robot is falling."""
+    robot: Articulation = env.scene[asset_cfg.name]
+    return torch.acos(-robot.data.projected_gravity_b[:, 2]).abs() > limit_angle
+
+
+# ===========================================================================
+# Later stages (not used in Stage 1)
+# ===========================================================================
+class GoalReached(ManagerTermBase):
+    """True once the robot has stayed inside the goal circle, nearly still, for settle_time_s.
+
+    Use in the env cfg as:
+        goal_reached = DoneTerm(func=mdp.GoalReached, params={"command_name": "goal_position",
+                                "lin_speed_max": 0.08, "yaw_speed_max": 0.10, "settle_time_s": 0.5})
     """
 
-    def __init__(
-        self,
-        cfg: TerminationTermCfg,
-        env: ManagerBasedRLEnv,
-    ):
+    def __init__(self, cfg: TerminationTermCfg, env: ManagerBasedRLEnv):
         super().__init__(cfg, env)
+        self.settled_steps = torch.zeros(env.num_envs, dtype=torch.long, device=env.device)
+        self.last_goal_counter = torch.full((env.num_envs,), -1, dtype=torch.long, device=env.device)
 
-        self._settled_steps = torch.zeros(
-            env.num_envs,
-            dtype=torch.long,
-            device=env.device,
-        )
-
-        self._last_goal_counter = torch.full(
-            (env.num_envs,),
-            -1,
-            dtype=torch.long,
-            device=env.device,
-        )
-
-    def reset(
-        self,
-        env_ids: Sequence[int] | slice | None = None,
-    ) -> None:
-        """Clear only the environments being reset."""
+    def reset(self, env_ids: Sequence[int] | slice | None = None):
         if env_ids is None:
             env_ids = slice(None)
-
-        self._settled_steps[env_ids] = 0
-        self._last_goal_counter[env_ids] = -1
+        self.settled_steps[env_ids] = 0
+        self.last_goal_counter[env_ids] = -1
 
     def __call__(
         self,
         env: ManagerBasedRLEnv,
         command_name: str = "goal_position",
-        linear_speed_threshold: float = 0.08,
-        angular_speed_threshold: float = 0.10,
+        lin_speed_max: float = 0.08,
+        yaw_speed_max: float = 0.10,
         settle_time_s: float = 0.5,
     ) -> torch.Tensor:
-        """Return a success boolean for each environment.
-
-        All conditions must hold continuously:
-            distance_xy <= configured goal_radius
-            horizontal speed <= linear_speed_threshold [m/s]
-            absolute world-Z angular speed <= angular_speed_threshold
-                [rad/s]
-
-        Leaving the circle or exceeding either speed threshold resets
-        that environment's settling counter.
-        """
-        if settle_time_s <= 0.0:
-            raise ValueError("settle_time_s must be positive.")
-
-        if linear_speed_threshold < 0.0 or angular_speed_threshold < 0.0:
-            raise ValueError("Speed thresholds must be non-negative.")
-
         term = env.command_manager.get_term(command_name)
 
-        # Do not carry settling time from one sampled goal to another.
-        changed_goal = term.command_counter != self._last_goal_counter
-        self._settled_steps[changed_goal] = 0
-        self._last_goal_counter[:] = term.command_counter
+        # a new goal restarts the settle timer
+        new_goal = term.command_counter != self.last_goal_counter
+        self.settled_steps[new_goal] = 0
+        self.last_goal_counter[:] = term.command_counter
 
-        inside_goal = term.goal_distance_xy <= term.cfg.goal_radius
+        inside = term.goal_distance_xy <= term.cfg.goal_radius
+        lin_speed = torch.norm(term.robot.data.root_lin_vel_w[:, :2], dim=-1)
+        yaw_speed = torch.abs(term.robot.data.root_ang_vel_w[:, 2])
+        settled = inside & (lin_speed <= lin_speed_max) & (yaw_speed <= yaw_speed_max)
 
-        horizontal_speed = torch.linalg.vector_norm(
-            term.robot.data.root_lin_vel_w[:, :2],
-            dim=-1,
-        )
-        yaw_speed = torch.abs(
-            term.robot.data.root_ang_vel_w[:, 2]
-        )
-
-        settled = (
-            inside_goal
-            & (horizontal_speed <= linear_speed_threshold)
-            & (yaw_speed <= angular_speed_threshold)
-        )
-
-        self._settled_steps[:] = torch.where(
-            settled,
-            self._settled_steps + 1,
-            torch.zeros_like(self._settled_steps),
-        )
-
-        required_steps = max(
-            1,
-            math.ceil(settle_time_s / env.step_dt),
-        )
-
-        return self._settled_steps >= required_steps
-
-
-def goal_timeout(
-    env: ManagerBasedRLEnv,
-    timeout_s: float = 20.0,
-) -> torch.Tensor:
-    """End a goal attempt after its episode time budget.
-
-    Stage 1 uses one goal per episode, so the episode clock is also the
-    goal-attempt clock. This does not restart when a waypoint changes.
-
-    Register this with time_out=True so the learning algorithm treats
-    it as a time-limit truncation.
-    """
-    if timeout_s <= 0.0:
-        raise ValueError("timeout_s must be positive.")
-
-    maximum_steps = max(
-        1,
-        math.ceil(timeout_s / env.step_dt),
-    )
-
-    return env.episode_length_buf >= maximum_steps
+        # count settled steps in a row, reset to 0 as soon as it moves or leaves the circle
+        self.settled_steps[:] = torch.where(settled, self.settled_steps + 1, torch.zeros_like(self.settled_steps))
+        need = max(1, math.ceil(settle_time_s / env.step_dt))
+        return self.settled_steps >= need

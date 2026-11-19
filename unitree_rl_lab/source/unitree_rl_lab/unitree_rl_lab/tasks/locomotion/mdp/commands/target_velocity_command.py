@@ -78,7 +78,7 @@ class TargetVelocityCommandCfg(UniformLevelVelocityCommandCfg):
     target_xy: tuple[float, float] | None = None  # None=random; (x,y)=fixed relative to env origin
     target_height: float = 0.0  # metres relative to env origin, for pose observation only
     target_orientation: tuple[float, float, float, float] = (1.0, 0.0, 0.0, 0.0)  # world w,x,y,z
-    initial_radius_range: tuple[float, float] = (0.0, 0.5)  # metres from robot at reset
+    initial_radius_range: tuple[float, float] = (2.0, 3.0)  # metres from robot at reset
     final_radius_range: tuple[float, float] = (4.0, 5.0)
     radius_increment: float = 0.5  # metres per successful curriculum update
     position_gain: float = 0.5  # 1/(m*s), multiplying signed squared position error

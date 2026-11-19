@@ -163,7 +163,7 @@ class CommandsCfg:
     base_velocity = mdp.TargetVelocityCommandCfg(
         asset_name="robot",
         target_xy=None,  # Random targets; set (x, y) for a fixed target relative to env origin.
-        initial_radius_range=(0.0, 0.5),
+        initial_radius_range=(2.0, 3.0),
         final_radius_range=(4.0, 5.0),
         radius_increment=0.5,
         position_gain=0.5,

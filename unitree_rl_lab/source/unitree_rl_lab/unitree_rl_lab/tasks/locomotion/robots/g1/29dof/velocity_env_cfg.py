@@ -174,7 +174,7 @@ class CommandsCfg:
         heading_command=False,
         debug_vis=True,
         ranges=mdp.UniformLevelVelocityCommandCfg.Ranges(
-            lin_vel_x=(-0.1, 0.1), lin_vel_y=(-0.1, 0.1), ang_vel_z=(-0.1, 0.1)
+            lin_vel_x=(-0.5, 0.5), lin_vel_y=(-0.3, 0.3), ang_vel_z=(-0.1, 0.1)
         ),
         limit_ranges=mdp.UniformLevelVelocityCommandCfg.Ranges(
             lin_vel_x=(-0.5, 1.0), lin_vel_y=(-0.3, 0.3), ang_vel_z=(-0.2, 0.2)
@@ -261,6 +261,10 @@ class ObservationsCfg:
 @configclass
 class RewardsCfg:
     """Reward terms for the MDP."""
+
+    target_distance_debug = RewTerm(
+        func=mdp.target_distance_debug, weight=1.0, params={"command_name": "base_velocity"}
+    )
 
     # -- task
     track_lin_vel_xy = RewTerm(

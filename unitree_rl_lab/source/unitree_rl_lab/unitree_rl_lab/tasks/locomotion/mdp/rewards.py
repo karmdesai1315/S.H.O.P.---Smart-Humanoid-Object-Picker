@@ -14,6 +14,19 @@ from isaaclab.sensors import ContactSensor
 if TYPE_CHECKING:
     from isaaclab.envs import ManagerBasedRLEnv
 
+
+def target_distance_debug(env: ManagerBasedRLEnv, command_name: str = "base_velocity") -> torch.Tensor:
+    """Log current root-to-target XY distance in metres without contributing reward.
+
+    CommandManager reports the per-environment metric as
+    Metrics/base_velocity/target_distance when environments reset.
+    """
+    command = env.command_manager.get_term(command_name)
+    distance = torch.linalg.vector_norm(command.target_pos_w - command.robot.data.root_pos_w[:, :2], dim=-1)
+    command.metrics["target_distance"].copy_(distance)
+    return torch.zeros_like(distance)
+
+
 """
 Joint penalties.
 """

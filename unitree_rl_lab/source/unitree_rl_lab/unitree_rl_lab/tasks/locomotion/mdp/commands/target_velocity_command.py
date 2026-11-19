@@ -23,6 +23,7 @@ class TargetVelocityCommand(UniformVelocityCommand):
         # Public target variable: world XY coordinates, one target per robot.
         self.target_pos_w = self.robot.data.root_pos_w[:, :2].clone()
         self.radius_range = tuple(cfg.initial_radius_range)
+        self.metrics["target_distance"] = torch.zeros(self.num_envs, device=self.device)
 
     def _resample_command(self, env_ids):
         if self.cfg.target_xy is not None:

@@ -143,7 +143,7 @@ def shelf_top(level: int) -> float:
 
 # Keep a straight approach to the front edge of the display. The banana is
 # static for this demo so the detected world point can be used after it leaves view.
-BANANA_POS = (3.28, 0.15, 0.82)
+BANANA_POS = (2.28, 0.15, 0.82)
 
 
 # Grocery products from NVIDIA's asset library (YCB objects with physics already set up).
@@ -204,7 +204,10 @@ class AisleSceneCfg(RobotSceneCfg):
         spawn=sim_utils.UsdFileCfg(
             usd_path=f"{ISAAC_NUCLEUS_DIR}/Props/YCB/Axis_Aligned/011_banana.usd",
         ),
-        init_state=AssetBaseCfg.InitialStateCfg(pos=BANANA_POS),
+        init_state=AssetBaseCfg.InitialStateCfg(
+            pos=BANANA_POS,
+            rot=(math.sqrt(0.5), 0.0, 0.0, math.sqrt(0.5)),  # +90 deg yaw, wxyz
+        ),
     )
 
     # other products on the shelves (distractors for perception, and a realistic-looking aisle)
@@ -301,10 +304,10 @@ class CommandsCfg:
         heading_command=False,
         debug_vis=True,
         ranges=mdp.UniformLevelVelocityCommandCfg.Ranges(
-            lin_vel_x=(0.0, 0.0), lin_vel_y=(0.0, 0.0), ang_vel_z=(-0.5, 0.5)
+            lin_vel_x=(0.5, 0.5), lin_vel_y=(0.0, 0.0), ang_vel_z=(-0.5, 0.5)
         ),
         limit_ranges=mdp.UniformLevelVelocityCommandCfg.Ranges(
-            lin_vel_x=(0.0, 0.0), lin_vel_y=(0.0, 0.0), ang_vel_z=(-0.5, 0.5)
+            lin_vel_x=(0.5, 0.5), lin_vel_y=(0.0, 0.0), ang_vel_z=(-0.5, 0.5)
         ),
     )
 

@@ -104,6 +104,7 @@ class TargetVelocityCommand(UniformVelocityCommand):
         self.vel_command_b[env_ids] = 0.0
         if self.cfg.yaw_gain is not None:
             self._update_target_yaw(env_ids, reset=True)
+            self.vel_command_b[env_ids, 0] = self.cfg.ranges.lin_vel_x[1]  # walk forward from the start
         elif self.cfg.fixed_forward_distance is not None:
             self.vel_command_b[env_ids, 0] = self.cfg.ranges.lin_vel_x[1]
 
@@ -132,6 +133,9 @@ class TargetVelocityCommand(UniformVelocityCommand):
             self.target_pos_w[waiting] = self.robot.data.root_pos_w[waiting, :2]
         if self.cfg.yaw_gain is not None:
             self._update_target_yaw(slice(None))
+            # walk forward at lin_vel_x while turning toward the target, stop inside the stop zone
+            reached = self.target_distance <= self.cfg.stop_distance
+            self.vel_command_b[:, 0] = (~reached) * self.cfg.ranges.lin_vel_x[1]
             if self.cfg.external_target:
                 self.vel_command_b[waiting] = 0.0
             return

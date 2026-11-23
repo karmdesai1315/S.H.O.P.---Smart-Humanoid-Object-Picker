@@ -22,6 +22,8 @@ class TargetVelocityCommand(UniformVelocityCommand):
                 raise ValueError("Target radius ranges must satisfy 0 <= min <= max <= 5 metres")
         # Public target variable: world XY coordinates, one target per robot.
         self.target_pos_w = self.robot.data.root_pos_w[:, :2].clone()
+        if cfg.external_target:
+            self._target_received = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
         self.radius_range = tuple(cfg.initial_radius_range)
         for name in (
             "target_error_x", "target_error_y", "target_distance",
@@ -74,7 +76,10 @@ class TargetVelocityCommand(UniformVelocityCommand):
         self.metrics["yaw_rate_command"].copy_(self.vel_command_b[:, 2])
 
     def _resample_command(self, env_ids):
-        if self.cfg.target_xy is not None:
+        if self.cfg.external_target:
+            self._target_received[env_ids] = False
+            self.target_pos_w[env_ids] = self.robot.data.root_pos_w[env_ids, :2]
+        elif self.cfg.target_xy is not None:
             # Pinpoint target relative to each environment's origin.
             self.target_pos_w[env_ids] = self._env.scene.env_origins[env_ids, :2] + torch.tensor(
                 self.cfg.target_xy, device=self.device
@@ -102,6 +107,13 @@ class TargetVelocityCommand(UniformVelocityCommand):
         elif self.cfg.fixed_forward_distance is not None:
             self.vel_command_b[env_ids, 0] = self.cfg.ranges.lin_vel_x[1]
 
+    def set_target_xy(self, env_ids, target_xy_w: torch.Tensor) -> None:
+        """Supply a detected ground-plane target in world coordinates."""
+        if not self.cfg.external_target:
+            raise RuntimeError("Enable external_target before setting a detected target")
+        self.target_pos_w[env_ids] = target_xy_w
+        self._target_received[env_ids] = True
+
     def _update_target_yaw(self, env_ids, reset=False):
         error_w = self.target_pos_w[env_ids] - self.robot.data.root_pos_w[env_ids, :2]
         distance = torch.linalg.vector_norm(error_w, dim=-1)
@@ -114,8 +126,14 @@ class TargetVelocityCommand(UniformVelocityCommand):
         self.vel_command_b[env_ids, 2] = yaw_rate.clamp(*self.cfg.ranges.ang_vel_z)
 
     def _update_command(self):
+        if self.cfg.external_target:
+            # Keep a stand target under the robot until perception provides a goal.
+            waiting = ~self._target_received
+            self.target_pos_w[waiting] = self.robot.data.root_pos_w[waiting, :2]
         if self.cfg.yaw_gain is not None:
             self._update_target_yaw(slice(None))
+            if self.cfg.external_target:
+                self.vel_command_b[waiting] = 0.0
             return
 
         # Target stays fixed in world coordinates while the robot approaches.
@@ -148,6 +166,7 @@ class TargetVelocityCommand(UniformVelocityCommand):
 @configclass
 class TargetVelocityCommandCfg(UniformLevelVelocityCommandCfg):
     class_type: type = TargetVelocityCommand
+    external_target: bool = False  # Wait for a world XY target from perception.
     target_xy: tuple[float, float] | None = None  # None=random; (x,y)=fixed relative to env origin
     fixed_forward_distance: float | None = None  # metres ahead at reset, with constant forward speed
     target_angle_range: tuple[float, float] = (-math.pi / 6, math.pi / 6)  # radians from reset heading

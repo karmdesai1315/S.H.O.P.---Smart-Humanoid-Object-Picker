@@ -2,7 +2,7 @@ import math
 
 import isaaclab.sim as sim_utils
 import isaaclab.terrains as terrain_gen
-from isaaclab.assets import ArticulationCfg, AssetBaseCfg
+from isaaclab.assets import ArticulationCfg, AssetBaseCfg, RigidObjectCfg
 from isaaclab.envs import ManagerBasedRLEnvCfg
 from isaaclab.managers import EventTermCfg as EventTerm
 from isaaclab.managers import ObservationGroupCfg as ObsGroup
@@ -11,7 +11,7 @@ from isaaclab.managers import RewardTermCfg as RewTerm
 from isaaclab.managers import SceneEntityCfg
 from isaaclab.managers import TerminationTermCfg as DoneTerm
 from isaaclab.scene import InteractiveSceneCfg
-from isaaclab.sensors import ContactSensorCfg, RayCasterCfg, patterns
+from isaaclab.sensors import CameraCfg, ContactSensorCfg, RayCasterCfg, patterns
 from isaaclab.terrains import TerrainImporterCfg
 from isaaclab.utils import configclass
 from isaaclab.utils.assets import ISAAC_NUCLEUS_DIR, ISAACLAB_NUCLEUS_DIR
@@ -82,6 +82,136 @@ class RobotSceneCfg(InteractiveSceneCfg):
         ),
     )
 
+
+AISLE_HALF_WIDTH = 0.70  # distance from aisle centre line to shelf front edge
+SHELF_DEPTH = 0.40
+SHELF_LENGTH = 2.00
+SHELF_CENTER_X = 2.00  # shelves run from x = 1.0 to x = 3.0
+BOARD_THICKNESS = 0.03
+SHELF_HEIGHTS = (0.40, 0.80, 1.10)  # top surface of each board is height + thickness/2
+UNIT_HEIGHT = 1.40  # height of the back panel
+
+# Head camera downward tilt in degrees (0 = straight ahead). The real G1's D435 is 47.6.
+CAMERA_PITCH_DEG = 20.0
+_pitch = math.radians(CAMERA_PITCH_DEG)
+CAMERA_ROT = (math.cos(_pitch / 2), 0.0, math.sin(_pitch / 2), 0.0)
+
+SHELF_COLOR = (0.75, 0.75, 0.78)
+PANEL_COLOR = (0.55, 0.55, 0.60)
+
+
+def static_box(prim_name: str, size: tuple, pos: tuple, color: tuple) -> AssetBaseCfg:
+    """A fixed box that the robot and objects can collide with (it never moves)."""
+    return AssetBaseCfg(
+        prim_path="{ENV_REGEX_NS}/Aisle_" + prim_name,
+        spawn=sim_utils.CuboidCfg(
+            size=size,
+            collision_props=sim_utils.CollisionPropertiesCfg(),
+            visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=color),
+        ),
+        init_state=AssetBaseCfg.InitialStateCfg(pos=pos),
+    )
+
+
+def board(side: int, level: int) -> AssetBaseCfg:
+    """One horizontal shelf board. side = +1 (left) or -1 (right)."""
+    y = side * (AISLE_HALF_WIDTH + SHELF_DEPTH / 2)
+    name = f"{'left' if side > 0 else 'right'}_board_{level}"
+    return static_box(
+        name,
+        size=(SHELF_LENGTH, SHELF_DEPTH, BOARD_THICKNESS),
+        pos=(SHELF_CENTER_X, y, SHELF_HEIGHTS[level]),
+        color=SHELF_COLOR,
+    )
+
+
+def back_panel(side: int) -> AssetBaseCfg:
+    y = side * (AISLE_HALF_WIDTH + SHELF_DEPTH + 0.01)
+    name = f"{'left' if side > 0 else 'right'}_back_panel"
+    return static_box(
+        name,
+        size=(SHELF_LENGTH, 0.02, UNIT_HEIGHT),
+        pos=(SHELF_CENTER_X, y, UNIT_HEIGHT / 2),
+        color=PANEL_COLOR,
+    )
+
+
+def shelf_top(level: int) -> float:
+    """Height of the top surface of a shelf board."""
+    return SHELF_HEIGHTS[level] + BOARD_THICKNESS / 2
+
+
+# Keep a straight approach to the front edge of the display. The banana is
+# static for this demo so the detected world point can be used after it leaves view.
+BANANA_POS = (3.28, 0.15, 0.82)
+
+
+# Grocery products from NVIDIA's asset library (YCB objects with physics already set up).
+# They are downloaded from NVIDIA's servers the first time they load.
+YCB_DIR = f"{ISAAC_NUCLEUS_DIR}/Props/YCB/Axis_Aligned_Physics"
+
+
+def grocery_item(name: str, usd_file: str, side: int, level: int, x: float) -> RigidObjectCfg:
+    """A YCB product placed on a shelf. It is spawned slightly above the board and settles onto it."""
+    y = side * (AISLE_HALF_WIDTH + 0.12)
+    return RigidObjectCfg(
+        prim_path="{ENV_REGEX_NS}/" + name,
+        spawn=sim_utils.UsdFileCfg(usd_path=f"{YCB_DIR}/{usd_file}"),
+        init_state=RigidObjectCfg.InitialStateCfg(pos=(x, y, shelf_top(level) + 0.12)),
+    )
+
+
+@configclass
+class AisleSceneCfg(RobotSceneCfg):
+    """The walking scene (robot, sensors, lights, floor) plus shelves and a target object."""
+
+    # Head RGB-D camera, at the real G1's D435 mount (from Unitree's URDF: d435_joint on torso_link).
+    # Cameras only render when the app is launched with --enable_cameras.
+    head_camera = CameraCfg(
+        prim_path="{ENV_REGEX_NS}/Robot/torso_link/head_camera",
+        update_period=0.1,
+        height=720,
+        width=960,
+        data_types=["rgb", "distance_to_image_plane"],
+        update_latest_camera_pose=True,
+        spawn=sim_utils.PinholeCameraCfg(
+            focal_length=15.2,  # ~69 deg horizontal field of view, like the D435 colour camera
+            horizontal_aperture=20.955,
+            clipping_range=(0.1, 20.0),
+        ),
+        offset=CameraCfg.OffsetCfg(
+            pos=(0.0576, 0.0175, 0.4299),
+            rot=CAMERA_ROT,
+            convention="world",  # camera looks along +x (forward), +z up
+        ),
+    )
+
+    # left shelf unit (y > 0)
+    left_board_0 = board(+1, 0)
+    left_board_1 = board(+1, 1)
+    left_board_2 = board(+1, 2)
+    left_back_panel = back_panel(+1)
+
+    # right shelf unit (y < 0)
+    right_board_0 = board(-1, 0)
+    right_board_1 = board(-1, 1)
+    right_board_2 = board(-1, 2)
+    right_back_panel = back_panel(-1)
+
+    display = static_box("BananaDisplay", (0.32, 0.48, 0.80), (3.45, 0.15, 0.40), SHELF_COLOR)
+    target_object = AssetBaseCfg(
+        prim_path="{ENV_REGEX_NS}/TargetBanana",
+        spawn=sim_utils.UsdFileCfg(
+            usd_path=f"{ISAAC_NUCLEUS_DIR}/Props/YCB/Axis_Aligned/011_banana.usd",
+        ),
+        init_state=AssetBaseCfg.InitialStateCfg(pos=BANANA_POS),
+    )
+
+    # other products on the shelves (distractors for perception, and a realistic-looking aisle)
+    cracker_box = grocery_item("CrackerBox", "003_cracker_box.usd", side=+1, level=1, x=1.5)
+    sugar_box = grocery_item("SugarBox", "004_sugar_box.usd", side=+1, level=0, x=2.3)
+    soup_can = grocery_item("SoupCan", "005_tomato_soup_can.usd", side=-1, level=1, x=1.8)
+    mustard = grocery_item("Mustard", "006_mustard_bottle.usd", side=-1, level=2, x=2.4)
 
 @configclass
 class EventCfg:
@@ -428,3 +558,23 @@ class RobotPlayEnvCfg(RobotEnvCfg):
         self.scene.terrain.terrain_generator.num_rows = 2
         self.scene.terrain.terrain_generator.num_cols = 10
         self.commands.base_velocity.ranges = self.commands.base_velocity.limit_ranges
+
+    def enable_aisle(self):
+        """Use the grocery aisle and wait for an RGB-D target during playback."""
+        self.scene = AisleSceneCfg(
+            num_envs=1,
+            env_spacing=5.0,
+            terrain=self.scene.terrain,
+            robot=self.scene.robot,
+            height_scanner=self.scene.height_scanner,
+            contact_forces=self.scene.contact_forces,
+            sky_light=self.scene.sky_light,
+        )
+        self.scene.terrain.terrain_type = "plane"
+        self.scene.terrain.terrain_generator = None
+        self.curriculum.terrain_levels = None
+        self.curriculum.lin_vel_cmd_levels = None
+        self.commands.base_velocity.external_target = True
+        self.events.push_robot = None
+        self.events.reset_base.params["pose_range"] = {"x": (0.0, 0.0), "y": (0.0, 0.0), "yaw": (0.0, 0.0)}
+        self.episode_length_s = 120.0

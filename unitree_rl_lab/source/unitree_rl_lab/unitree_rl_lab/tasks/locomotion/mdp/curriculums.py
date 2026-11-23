@@ -37,6 +37,28 @@ def lin_vel_cmd_levels(
     return torch.tensor(ranges.lin_vel_x[1], device=env.device)
 
 
+def target_radius_levels(
+    env: ManagerBasedRLEnv,
+    env_ids: Sequence[int],
+    reward_term_name: str = "track_lin_vel_xy",
+) -> torch.Tensor:
+    """Advance target radii using the linear velocity curriculum's timing and threshold."""
+    command_term = env.command_manager.get_term("base_velocity")
+    if command_term.cfg.target_xy is None:
+        reward_term = env.reward_manager.get_term_cfg(reward_term_name)
+        reward = torch.mean(env.reward_manager._episode_sums[reward_term_name][env_ids]) / env.max_episode_length_s
+        if env.common_step_counter % env.max_episode_length == 0:
+            if reward > reward_term.weight * 0.8:
+                low, high = command_term.radius_range
+                final_low, final_high = command_term.cfg.final_radius_range
+                increment = command_term.cfg.radius_increment
+                command_term.radius_range = (
+                    min(low + increment, final_low),
+                    min(high + increment, final_high),
+                )
+    return torch.tensor(command_term.radius_range[1], device=env.device)
+
+
 def ang_vel_cmd_levels(
     env: ManagerBasedRLEnv,
     env_ids: Sequence[int],

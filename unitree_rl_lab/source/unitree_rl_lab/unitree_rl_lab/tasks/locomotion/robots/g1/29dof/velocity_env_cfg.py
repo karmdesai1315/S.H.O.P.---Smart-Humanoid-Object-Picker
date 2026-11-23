@@ -4,7 +4,6 @@ import isaaclab.sim as sim_utils
 import isaaclab.terrains as terrain_gen
 from isaaclab.assets import ArticulationCfg, AssetBaseCfg
 from isaaclab.envs import ManagerBasedRLEnvCfg
-from isaaclab.managers import CurriculumTermCfg as CurrTerm
 from isaaclab.managers import EventTermCfg as EventTerm
 from isaaclab.managers import ObservationGroupCfg as ObsGroup
 from isaaclab.managers import ObservationTermCfg as ObsTerm
@@ -160,18 +159,22 @@ class EventCfg:
 class CommandsCfg:
     """Command specifications for the MDP."""
 
-    base_velocity = mdp.UniformLevelVelocityCommandCfg(
+    base_velocity = mdp.TargetVelocityCommandCfg(
         asset_name="robot",
-        resampling_time_range=(10.0, 10.0),
-        rel_standing_envs=0.02,
+        initial_radius_range=(2.0, 5.0),
+        target_angle_range=(-math.pi, math.pi),
+        yaw_gain=1.0,
+        stop_distance=0.3,
+        resampling_time_range=(1.0e9, 1.0e9),  # One stationary target per episode.
+        rel_standing_envs=0.0,
         rel_heading_envs=1.0,
         heading_command=False,
         debug_vis=True,
         ranges=mdp.UniformLevelVelocityCommandCfg.Ranges(
-            lin_vel_x=(-0.1, 0.1), lin_vel_y=(-0.1, 0.1), ang_vel_z=(-0.1, 0.1)
+            lin_vel_x=(0.0, 0.0), lin_vel_y=(0.0, 0.0), ang_vel_z=(-0.5, 0.5)
         ),
         limit_ranges=mdp.UniformLevelVelocityCommandCfg.Ranges(
-            lin_vel_x=(-0.5, 1.0), lin_vel_y=(-0.3, 0.3), ang_vel_z=(-0.2, 0.2)
+            lin_vel_x=(0.0, 0.0), lin_vel_y=(0.0, 0.0), ang_vel_z=(-0.5, 0.5)
         ),
     )
 
@@ -194,16 +197,26 @@ class ObservationsCfg:
         """Observations for policy group."""
 
         # observation terms (order preserved)
+        base_lin_vel = ObsTerm(func=mdp.base_lin_vel)
         base_ang_vel = ObsTerm(func=mdp.base_ang_vel, scale=0.2, noise=Unoise(n_min=-0.2, n_max=0.2))
         projected_gravity = ObsTerm(func=mdp.projected_gravity, noise=Unoise(n_min=-0.05, n_max=0.05))
         velocity_commands = ObsTerm(func=mdp.generated_commands, params={"command_name": "base_velocity"})
         joint_pos_rel = ObsTerm(func=mdp.joint_pos_rel, noise=Unoise(n_min=-0.01, n_max=0.01))
         joint_vel_rel = ObsTerm(func=mdp.joint_vel_rel, scale=0.05, noise=Unoise(n_min=-1.5, n_max=1.5))
         last_action = ObsTerm(func=mdp.last_action)
+        robot_pose = ObsTerm(func=mdp.robot_pose)
+        target_pose = ObsTerm(func=mdp.target_pose)
+        obstacle_states = ObsTerm(func=mdp.obstacle_states_placeholder, history_length=6)
         # gait_phase = ObsTerm(func=mdp.gait_phase, params={"period": 0.8})
 
         def __post_init__(self):
-            self.history_length = 5
+            # A group override would replace the obstacle term's six-step history.
+            self.history_length = 0
+            for name in (
+                "base_lin_vel", "base_ang_vel", "projected_gravity", "velocity_commands",
+                "joint_pos_rel", "joint_vel_rel", "last_action", "robot_pose", "target_pose",
+            ):
+                getattr(self, name).history_length = 5
             self.enable_corruption = True
             self.concatenate_terms = True
 
@@ -221,6 +234,9 @@ class ObservationsCfg:
         joint_pos_rel = ObsTerm(func=mdp.joint_pos_rel)
         joint_vel_rel = ObsTerm(func=mdp.joint_vel_rel, scale=0.05)
         last_action = ObsTerm(func=mdp.last_action)
+        robot_pose = ObsTerm(func=mdp.robot_pose)
+        target_pose = ObsTerm(func=mdp.target_pose)
+        obstacle_states = ObsTerm(func=mdp.obstacle_states_placeholder, history_length=6)
         # gait_phase = ObsTerm(func=mdp.gait_phase, params={"period": 0.8})
         # height_scanner = ObsTerm(func=mdp.height_scan,
         #     params={"sensor_cfg": SceneEntityCfg("height_scanner")},
@@ -228,7 +244,12 @@ class ObservationsCfg:
         # )
 
         def __post_init__(self):
-            self.history_length = 5
+            self.history_length = 0
+            for name in (
+                "base_lin_vel", "base_ang_vel", "projected_gravity", "velocity_commands",
+                "joint_pos_rel", "joint_vel_rel", "last_action", "robot_pose", "target_pose",
+            ):
+                getattr(self, name).history_length = 5
 
     # privileged observations
     critic: CriticCfg = CriticCfg()
@@ -238,12 +259,13 @@ class ObservationsCfg:
 class RewardsCfg:
     """Reward terms for the MDP."""
 
-    # -- task
-    track_lin_vel_xy = RewTerm(
-        func=mdp.track_lin_vel_xy_yaw_frame_exp,
-        weight=1.0,
-        params={"command_name": "base_velocity", "std": math.sqrt(0.25)},
+    target_distance_debug = RewTerm(
+        func=mdp.target_distance_debug, weight=1.0, params={"command_name": "base_velocity"}
     )
+
+    # -- task
+    target_distance = RewTerm(func=mdp.target_distance_reward, weight=3.0, params={"beta": 0.1})
+    target_stop = RewTerm(func=mdp.target_stop_reward, weight=2.0, params={"std": 0.1})
     track_ang_vel_z = RewTerm(
         func=mdp.track_ang_vel_z_exp, weight=0.5, params={"command_name": "base_velocity", "std": math.sqrt(0.25)}
     )
@@ -304,6 +326,7 @@ class RewardsCfg:
             "offset": [0.0, 0.5],
             "threshold": 0.55,
             "command_name": "base_velocity",
+            "use_target_distance": True,
             "sensor_cfg": SceneEntityCfg("contact_forces", body_names=".*ankle_roll.*"),
         },
     )
@@ -350,8 +373,9 @@ class TerminationsCfg:
 class CurriculumCfg:
     """Curriculum terms for the MDP."""
 
-    terrain_levels = CurrTerm(func=mdp.terrain_levels_vel)
-    lin_vel_cmd_levels = CurrTerm(mdp.lin_vel_cmd_levels)
+    terrain_levels = None
+    lin_vel_cmd_levels = None
+    target_radius_levels = None
 
 
 @configclass

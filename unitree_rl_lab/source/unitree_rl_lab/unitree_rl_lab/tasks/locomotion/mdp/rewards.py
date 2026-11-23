@@ -14,6 +14,31 @@ from isaaclab.sensors import ContactSensor
 if TYPE_CHECKING:
     from isaaclab.envs import ManagerBasedRLEnv
 
+
+def target_distance_debug(env: ManagerBasedRLEnv, command_name: str = "base_velocity") -> torch.Tensor:
+    """Update target and yaw metrics each step without contributing reward.
+
+    CommandManager reports them under Metrics/base_velocity/ at reset.
+    """
+    command = env.command_manager.get_term(command_name)
+    command.update_target_metrics()
+    return torch.zeros_like(command.metrics["target_distance"])
+
+
+def target_distance_reward(env: ManagerBasedRLEnv, beta: float, command_name: str = "base_velocity") -> torch.Tensor:
+    """Reward proximity, with a flat reward inside the target zone."""
+    command = env.command_manager.get_term(command_name)
+    distance = command.target_distance.clamp_min(command.cfg.stop_distance)
+    return torch.exp(-beta * distance.square())
+
+
+def target_stop_reward(env: ManagerBasedRLEnv, std: float, command_name: str = "base_velocity") -> torch.Tensor:
+    """Reward low XY speed inside the target zone while allowing rotation."""
+    command = env.command_manager.get_term(command_name)
+    speed_squared = command.robot.data.root_lin_vel_w[:, :2].square().sum(dim=-1)
+    return torch.exp(-speed_squared / std**2) * (command.target_distance <= command.cfg.stop_distance)
+
+
 """
 Joint penalties.
 """
@@ -178,6 +203,7 @@ def feet_gait(
     sensor_cfg: SceneEntityCfg,
     threshold: float = 0.5,
     command_name=None,
+    use_target_distance: bool = False,
 ) -> torch.Tensor:
     contact_sensor: ContactSensor = env.scene.sensors[sensor_cfg.name]
     is_contact = contact_sensor.data.current_contact_time[:, sensor_cfg.body_ids] > 0
@@ -196,7 +222,11 @@ def feet_gait(
 
     if command_name is not None:
         cmd_norm = torch.norm(env.command_manager.get_command(command_name), dim=1)
-        reward *= cmd_norm > 0.1
+        moving = cmd_norm > 0.1
+        if use_target_distance:
+            command = env.command_manager.get_term(command_name)
+            moving |= command.target_distance > command.cfg.stop_distance
+        reward *= moving
     return reward
 
 

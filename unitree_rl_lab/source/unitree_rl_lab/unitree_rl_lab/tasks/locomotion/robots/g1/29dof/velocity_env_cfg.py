@@ -141,9 +141,10 @@ def shelf_top(level: int) -> float:
     return SHELF_HEIGHTS[level] + BOARD_THICKNESS / 2
 
 
-# Keep a straight approach to the front edge of the display. The banana is
-# static for this demo so the detected world point can be used after it leaves view.
-BANANA_POS = (2.28, 0.15, 0.82)
+# Banana on the left shelf, middle level, near the front edge so the arm can reach it.
+# It is static for this demo so the detected world point can be used after it leaves view.
+BANANA_SHELF_LEVEL = 1  # 0 = bottom (0.40 m), 1 = middle (0.80 m), 2 = top (1.10 m)
+BANANA_POS = (2.0, AISLE_HALF_WIDTH + 0.10, shelf_top(BANANA_SHELF_LEVEL) + 0.022)
 
 
 # Grocery products from NVIDIA's asset library (YCB objects with physics already set up).
@@ -198,7 +199,6 @@ class AisleSceneCfg(RobotSceneCfg):
     right_board_2 = board(-1, 2)
     right_back_panel = back_panel(-1)
 
-    display = static_box("BananaDisplay", (0.32, 0.48, 0.80), (3.45, 0.15, 0.40), SHELF_COLOR)
     target_object = AssetBaseCfg(
         prim_path="{ENV_REGEX_NS}/TargetBanana",
         spawn=sim_utils.UsdFileCfg(
@@ -210,11 +210,11 @@ class AisleSceneCfg(RobotSceneCfg):
         ),
     )
 
-    # other products on the shelves (distractors for perception, and a realistic-looking aisle)
-    cracker_box = grocery_item("CrackerBox", "003_cracker_box.usd", side=+1, level=1, x=1.5)
-    sugar_box = grocery_item("SugarBox", "004_sugar_box.usd", side=+1, level=0, x=2.3)
-    soup_can = grocery_item("SoupCan", "005_tomato_soup_can.usd", side=-1, level=1, x=1.8)
-    mustard = grocery_item("Mustard", "006_mustard_bottle.usd", side=-1, level=2, x=2.4)
+    # other products on the shelves (distractors for perception) - switched off for now, banana only
+    # cracker_box = grocery_item("CrackerBox", "003_cracker_box.usd", side=+1, level=1, x=1.5)
+    # sugar_box = grocery_item("SugarBox", "004_sugar_box.usd", side=+1, level=0, x=2.3)
+    # soup_can = grocery_item("SoupCan", "005_tomato_soup_can.usd", side=-1, level=1, x=1.8)
+    # mustard = grocery_item("Mustard", "006_mustard_bottle.usd", side=-1, level=2, x=2.4)
 
 @configclass
 class EventCfg:

@@ -39,6 +39,15 @@ def target_stop_reward(env: ManagerBasedRLEnv, std: float, command_name: str = "
     return torch.exp(-speed_squared / std**2) * (command.target_distance <= command.cfg.stop_distance)
 
 
+def pickup_base_drift(env: ManagerBasedRLEnv) -> torch.Tensor:
+    """Penalize base speed and XY displacement from the point where pickup started."""
+    action = env.action_manager.get_term("JointPositionAction")
+    robot = env.scene["robot"]
+    drift = (robot.data.root_pos_w[:, :2] - action.anchor_xy).square().sum(dim=-1)
+    speed = robot.data.root_lin_vel_w[:, :2].square().sum(dim=-1)
+    return (speed + 4.0 * drift) * action.active
+
+
 """
 Joint penalties.
 """

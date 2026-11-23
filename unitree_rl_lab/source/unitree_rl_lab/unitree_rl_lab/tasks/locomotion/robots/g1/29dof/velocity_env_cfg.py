@@ -2,6 +2,7 @@ import math
 
 import isaaclab.sim as sim_utils
 import isaaclab.terrains as terrain_gen
+import torch
 from isaaclab.assets import ArticulationCfg, AssetBaseCfg, RigidObjectCfg
 from isaaclab.envs import ManagerBasedRLEnvCfg
 from isaaclab.managers import EventTermCfg as EventTerm
@@ -18,6 +19,7 @@ from isaaclab.utils.assets import ISAAC_NUCLEUS_DIR, ISAACLAB_NUCLEUS_DIR
 from isaaclab.utils.noise import AdditiveUniformNoiseCfg as Unoise
 
 from unitree_rl_lab.assets.robots.unitree import UNITREE_G1_29DOF_CFG as ROBOT_CFG
+from unitree_rl_lab.assets.robots.unitree import g1_inspire_cfg, g1_policy_joint_order
 from unitree_rl_lab.tasks.locomotion import mdp
 
 COBBLESTONE_ROAD_CFG = terrain_gen.TerrainGeneratorCfg(
@@ -142,9 +144,37 @@ def shelf_top(level: int) -> float:
 
 
 # Banana on the left shelf, middle level, near the front edge so the arm can reach it.
-# It is static for this demo so the detected world point can be used after it leaves view.
 BANANA_SHELF_LEVEL = 1  # 0 = bottom (0.40 m), 1 = middle (0.80 m), 2 = top (1.10 m)
 BANANA_POS = (2.0, AISLE_HALF_WIDTH + 0.10, shelf_top(BANANA_SHELF_LEVEL) + 0.022)
+
+
+def spawn_graspable_banana(prim_path, cfg, translation=None, orientation=None):
+    """Add mass, friction, and convex collision to the existing YCB visual asset."""
+    from pxr import UsdGeom, UsdPhysics, UsdShade
+
+    prim = sim_utils.spawn_from_usd(prim_path, cfg, translation=translation, orientation=orientation)
+    UsdPhysics.RigidBodyAPI.Apply(prim)
+    UsdPhysics.MassAPI.Apply(prim).CreateMassAttr(0.12)
+    material = UsdShade.Material.Define(prim.GetStage(), prim.GetPath().AppendChild("GripMaterial"))
+    physics = UsdPhysics.MaterialAPI.Apply(material.GetPrim())
+    physics.CreateStaticFrictionAttr(1.2)
+    physics.CreateDynamicFrictionAttr(1.0)
+    def collision_meshes(parent):
+        if parent.IsInstance():
+            parent.SetInstanceable(False)
+        if parent.IsA(UsdGeom.Mesh):
+            yield parent
+        for child in parent.GetChildren():
+            yield from collision_meshes(child)
+
+    meshes = list(collision_meshes(prim))
+    if not meshes:
+        raise RuntimeError("The YCB banana USD contains no collision mesh")
+    for mesh in meshes:
+        UsdPhysics.CollisionAPI.Apply(mesh)
+        UsdPhysics.MeshCollisionAPI.Apply(mesh).CreateApproximationAttr("convexHull")
+        UsdShade.MaterialBindingAPI.Apply(mesh).Bind(material, materialPurpose="physics")
+    return prim
 
 
 # Grocery products from NVIDIA's asset library (YCB objects with physics already set up).
@@ -219,6 +249,8 @@ class AisleSceneCfg(RobotSceneCfg):
 @configclass
 class EventCfg:
     """Configuration for events."""
+
+    reset_banana: EventTerm | None = None
 
     # startup
     physics_material = EventTerm(
@@ -321,6 +353,79 @@ class ActionsCfg:
     )
 
 
+class PickupJointPositionAction(mdp.JointPositionAction):
+    """Keep the policy's body action layout and override only the left arm during pickup."""
+
+    def __init__(self, cfg, env):
+        super().__init__(cfg, env)
+        arm_parts = (
+            "shoulder_pitch", "shoulder_roll", "shoulder_yaw", "elbow",
+            "wrist_roll", "wrist_pitch", "wrist_yaw",
+        )
+        names = [f"left_{part}_joint" for part in arm_parts]
+        self._arm_ids = [self._asset.joint_names.index(name) for name in names]
+        self._arm_columns = [self._joint_ids.index(joint_id) for joint_id in self._arm_ids]
+        self.active = torch.zeros(env.num_envs, dtype=torch.bool, device=env.device)
+        self.anchor_xy = self._asset.data.root_pos_w[:, :2].clone()
+        self._arm_targets = self._asset.data.joint_pos[:, self._arm_ids].clone()
+        self._arm_start = self._arm_targets.clone()
+        self._elapsed = torch.zeros(env.num_envs, device=env.device)
+        self._settled = torch.zeros_like(self._elapsed)
+        self._reach = self._arm_targets.new_tensor(cfg.balance_reach)
+
+    def begin_pickup(self, env_ids):
+        self.active[env_ids] = True
+        self.anchor_xy[env_ids] = self._asset.data.root_pos_w[env_ids, :2]
+        self._arm_start[env_ids] = self._asset.data.joint_pos[env_ids][:, self._arm_ids]
+        self._arm_targets[env_ids] = self._arm_start[env_ids]
+        self._env.command_manager.get_term("base_velocity").hold_position(env_ids)
+
+    def set_arm_targets(self, env_ids, positions):
+        self._arm_targets[env_ids] = positions
+
+    def process_actions(self, actions):
+        super().process_actions(actions)
+        if not self.cfg.train_balance:
+            return
+        command = self._env.command_manager.get_term("base_velocity")
+        speed = self._asset.data.root_lin_vel_w[:, :2].norm(dim=-1)
+        aligned = command.metrics["target_yaw_error"].abs() < math.radians(8)
+        turning_slowly = self._asset.data.root_ang_vel_w[:, 2].abs() < 0.1
+        ready = (command.target_distance <= command.cfg.stop_distance) & (speed < 0.08) & aligned & turning_slowly
+        dt = self._env.step_dt
+        self._settled = torch.where(ready, self._settled + dt, 0.0)
+        self.begin_pickup((~self.active & (self._settled >= 0.4)).nonzero(as_tuple=True)[0])
+        self._elapsed += dt * self.active
+        # Apply a slow, sustained reach/lift disturbance so PPO experiences arm load shifts.
+        phase = (self._elapsed / 2.5).clamp(0.0, 1.0).unsqueeze(-1)
+        blend = phase.square() * (3.0 - 2.0 * phase)
+        self._arm_targets[:] = torch.lerp(self._arm_start, self._reach, blend)
+
+    def apply_actions(self):
+        super().apply_actions()
+        if self.cfg.train_balance:
+            targets = torch.where(
+                self.active.unsqueeze(1), self._arm_targets, self.processed_actions[:, self._arm_columns]
+            )
+            self._asset.set_joint_position_target(targets, joint_ids=self._arm_ids)
+        elif self.active[0]:
+            self._asset.set_joint_position_target(self._arm_targets, joint_ids=self._arm_ids)
+
+    def reset(self, env_ids=None):
+        super().reset(env_ids)
+        env_ids = slice(None) if env_ids is None else env_ids
+        self.active[env_ids] = False
+        self._elapsed[env_ids] = 0.0
+        self._settled[env_ids] = 0.0
+
+
+@configclass
+class PickupJointPositionActionCfg(mdp.JointPositionActionCfg):
+    class_type: type = PickupJointPositionAction
+    train_balance: bool = False
+    balance_reach: tuple[float, ...] = (-0.75, 0.20, 0.0, 0.35, 0.0, 0.10, 0.0)
+
+
 @configclass
 class ObservationsCfg:
     """Observation specifications for the MDP."""
@@ -391,6 +496,8 @@ class ObservationsCfg:
 @configclass
 class RewardsCfg:
     """Reward terms for the MDP."""
+
+    pickup_drift: RewTerm | None = None
 
     target_distance_debug = RewTerm(
         func=mdp.target_distance_debug, weight=1.0, params={"command_name": "base_velocity"}
@@ -527,6 +634,29 @@ class RobotEnvCfg(ManagerBasedRLEnvCfg):
     events: EventCfg = EventCfg()
     curriculum: CurriculumCfg = CurriculumCfg()
 
+    def enable_inspire(self, urdf_path=None, checkpoint=None, train_balance=False):
+        """Swap the articulation while keeping the Stage 1 policy's 29 body joints."""
+        self.scene.robot = g1_inspire_cfg(urdf_path).replace(prim_path="{ENV_REGEX_NS}/Robot")
+        names, preserve_order = g1_policy_joint_order(checkpoint)
+        joint_action = self.actions.JointPositionAction
+        self.actions.JointPositionAction = PickupJointPositionActionCfg(
+            asset_name=joint_action.asset_name,
+            joint_names=names,
+            preserve_order=preserve_order,
+            scale=joint_action.scale,
+            offset=joint_action.offset,
+            use_default_offset=joint_action.use_default_offset,
+            clip=joint_action.clip,
+            train_balance=train_balance,
+        )
+        for group in (self.observations.policy, self.observations.critic):
+            for term in (group.joint_pos_rel, group.joint_vel_rel):
+                term.params["asset_cfg"] = SceneEntityCfg(
+                    "robot", joint_names=names, preserve_order=preserve_order
+                )
+        if train_balance:
+            self.rewards.pickup_drift = RewTerm(func=mdp.pickup_base_drift, weight=-0.5)
+
     def __post_init__(self):
         """Post initialization."""
         # general settings
@@ -562,7 +692,7 @@ class RobotPlayEnvCfg(RobotEnvCfg):
         self.scene.terrain.terrain_generator.num_cols = 10
         self.commands.base_velocity.ranges = self.commands.base_velocity.limit_ranges
 
-    def enable_aisle(self):
+    def enable_aisle(self, pickup=False):
         """Use the grocery aisle and wait for an RGB-D target during playback."""
         self.scene = AisleSceneCfg(
             num_envs=1,
@@ -575,6 +705,18 @@ class RobotPlayEnvCfg(RobotEnvCfg):
         )
         self.scene.terrain.terrain_type = "plane"
         self.scene.terrain.terrain_generator = None
+        if pickup:
+            banana = self.scene.target_object
+            self.scene.target_object = RigidObjectCfg(
+                prim_path=banana.prim_path,
+                spawn=banana.spawn.replace(func=spawn_graspable_banana),
+                init_state=RigidObjectCfg.InitialStateCfg(pos=banana.init_state.pos, rot=banana.init_state.rot),
+            )
+            self.events.reset_banana = EventTerm(
+                func=mdp.reset_root_state_uniform,
+                mode="reset",
+                params={"pose_range": {}, "velocity_range": {}, "asset_cfg": SceneEntityCfg("target_object")},
+            )
         self.curriculum.terrain_levels = None
         self.curriculum.lin_vel_cmd_levels = None
         self.commands.base_velocity.external_target = True

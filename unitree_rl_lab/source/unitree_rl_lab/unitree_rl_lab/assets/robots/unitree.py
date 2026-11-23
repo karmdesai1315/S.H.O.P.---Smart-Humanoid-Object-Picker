@@ -9,6 +9,7 @@ Reference: https://github.com/unitreerobotics/unitree_ros
 """
 
 import os
+from pathlib import Path
 
 import isaaclab.sim as sim_utils
 from isaaclab.actuators import IdealPDActuatorCfg, ImplicitActuatorCfg
@@ -19,6 +20,56 @@ from unitree_rl_lab.assets.robots import unitree_actuators
 
 UNITREE_MODEL_DIR = "path/to/unitree_model"  # Replace with the actual path to your unitree_model directory
 UNITREE_ROS_DIR = "path/to/unitree_ros"  # Replace with the actual path to your unitree_ros package
+
+INSPIRE_URDF_NAME = "g1_29dof_rev_1_0_with_inspire_hand_DFQ.urdf"
+
+
+def g1_inspire_cfg(urdf_path: str | None = None):
+    """Use the existing G1 body actuators with position drives on the Inspire fingers."""
+    path = Path(urdf_path or Path(UNITREE_ROS_DIR) / "robots" / "g1_description" / INSPIRE_URDF_NAME).expanduser()
+    if not path.is_file():
+        raise FileNotFoundError(f"Inspire DFQ URDF missing at {path}. Pass --inspire_urdf with its location.")
+    base = UNITREE_G1_29DOF_CFG
+    return base.replace(
+        spawn=UnitreeUrdfFileCfg(asset_path=str(path.resolve())),
+        init_state=base.init_state.replace(joint_pos={**base.init_state.joint_pos, "[LR]_.*_joint": 0.0}),
+        actuators={
+            **base.actuators,
+            "inspire_hand": ImplicitActuatorCfg(
+                joint_names_expr=["[LR]_.*_joint"],
+                effort_limit_sim=1.0,
+                velocity_limit_sim=3.0,
+                stiffness=3.0,
+                damping=0.1,
+                armature=0.001,
+            ),
+        },
+    )
+
+
+def g1_policy_joint_order(checkpoint):
+    """Use the 29-joint checkpoint's recorded mapping when available."""
+    names = list(UNITREE_G1_29DOF_CFG.joint_sdk_names)
+    if checkpoint:
+        params = Path(checkpoint).parent / "params"
+        deploy = params / "deploy.yaml"
+        env_cfg = params / "env.yaml"
+        if deploy.is_file():
+            import yaml
+
+            with deploy.open(encoding="utf-8") as file:
+                indices = yaml.safe_load(file)["joint_ids_map"]
+            if sorted(indices) != list(range(len(names))):
+                raise ValueError(f"Expected a 29-body-joint mapping in {deploy}")
+            return [names[index] for index in indices], True
+        if env_cfg.is_file():
+            import yaml
+
+            with env_cfg.open(encoding="utf-8") as file:
+                action = yaml.load(file, Loader=yaml.BaseLoader)["actions"]["JointPositionAction"]
+            if action.get("preserve_order", "").lower() == "true" and sorted(action["joint_names"]) == sorted(names):
+                return action["joint_names"], True
+    return names, False
 
 
 @configclass

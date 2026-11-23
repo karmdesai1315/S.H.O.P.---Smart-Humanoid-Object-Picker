@@ -2,7 +2,7 @@
 
 SIMULATION ONLY. This module does NOT step the simulator, alter other joints,
 apply torques, or command hardware. The host supplies an Articulation, timestep,
-and a target wrist XYZ expressed in torso_link coordinates (meters).
+and either a torso-frame wrist point or a world-frame grasp point (meters).
 
 The returned joint-position targets must be merged with the host's existing
 whole-body command. Host owns locomotion, actuator gains, collision monitoring,
@@ -28,6 +28,7 @@ class Phase(str, Enum):
     IDLE = "IDLE"
     PRE_GRASP = "PRE_GRASP"
     REACH = "REACH"
+    CLOSE = "CLOSE"
     LIFT = "LIFT"
     RETRACT = "RETRACT"
     RETURN_PRE_GRASP = "RETURN_PRE_GRASP"
@@ -80,6 +81,7 @@ class G1LeftArmController:
         self._reach_xyz = None
         self._target_xyz = None
         self._failure_reason = None
+        self._pickup_world = None
 
     def _find_arm_joints(self):
         names = list(self.robot.joint_names)
@@ -174,10 +176,102 @@ class G1LeftArmController:
         if xyz.shape != (3,) or not bool(torch.isfinite(xyz).all()):
             raise ValueError("reach_xyz_torso must be 3 finite coordinates in meters")
         self._reach_xyz = xyz.clone()
+        self._pickup_world = None
         self._home = self.arm_q()
         self._last_command = self._home.clone()
         self._failure_reason = None
         self._enter(Phase.PRE_GRASP)
+
+    def reset(self):
+        """Release pickup state after the host resets the environment."""
+        self._pickup_world = None
+        self._enter(Phase.IDLE)
+
+    def start_pickup(self, target_xyz_w, facing_yaw):
+        """Approach a shelf object with the Inspire grasp center in world coordinates."""
+        from isaaclab.utils.math import quat_from_euler_xyz
+
+        self.start([0.0, 0.0, 0.0])
+        self._pickup_world = target_xyz_w.to(device=self.device, dtype=self.dtype).clone()
+        if self._pickup_world.shape != (3,) or not bool(torch.isfinite(self._pickup_world).all()):
+            self.reset()
+            raise ValueError("Pickup requires a finite world XYZ point")
+        yaw = self._pickup_world.new_tensor(facing_yaw)
+        self._grasp_quat = quat_from_euler_xyz(yaw.new_tensor(torch.pi / 2), yaw.new_zeros(()), yaw)
+        self._grasp_offset = self._pickup_world.new_tensor((0.185, -0.025, 0.0))
+        self._approach_world = self._pickup_world + self._pickup_world.new_tensor((0.0, 0.0, 0.07))
+        self._lift_world = self._pickup_world + self._pickup_world.new_tensor((0.0, 0.0, self.cfg.lift_m))
+        self._phase_xyz_w, _ = self.grasp_pose_w()
+
+    def grasp_pose_w(self):
+        """Position of the Inspire grasp center and orientation of the wrist link."""
+        from isaaclab.utils.math import quat_apply
+
+        data = self.robot.data
+        pos = data.body_link_pos_w[self.env_id, self.wrist_id]
+        quat = data.body_link_quat_w[self.env_id, self.wrist_id]
+        return pos + quat_apply(quat.unsqueeze(0), self._grasp_offset.unsqueeze(0))[0], quat
+
+    @property
+    def finger_closure(self):
+        if self.phase == Phase.CLOSE:
+            return min(1.0, self.elapsed / 1.0)
+        return float(self.phase in (Phase.LIFT, Phase.DONE))
+
+    def _pickup_ik(self, xyz, dt):
+        from isaaclab.utils.math import compute_pose_error
+
+        point, quat = self.grasp_pose_w()
+        pos_error, rot_error = compute_pose_error(
+            point.unsqueeze(0), quat.unsqueeze(0), xyz.unsqueeze(0), self._grasp_quat.unsqueeze(0),
+            rot_error_type="axis_angle",
+        )
+        jacobians = self.robot.root_physx_view.get_jacobians()
+        col_offset = jacobians.shape[-1] - self.robot.num_joints
+        row = self.wrist_id - int(not self.robot.is_fixed_base)
+        columns = [index + col_offset for index in self.joint_ids]
+        jacobian = jacobians[self.env_id, row, :, :][:, columns]
+        # PhysX returns a COM-referenced Jacobian. Shift it to the grasp center.
+        lever = point - self.robot.data.body_com_pos_w[self.env_id, self.wrist_id]
+        angular = jacobian[3:, :]
+        linear = jacobian[:3, :] + torch.cross(angular.T, lever.expand(7, -1), dim=-1).T
+        orientation_weight = 0.18
+        task_jacobian = torch.cat((linear, orientation_weight * angular), dim=0)
+        error = torch.cat((pos_error[0], orientation_weight * rot_error[0]))
+        damping = (self.cfg.damping ** 2) * torch.eye(6, device=self.device, dtype=self.dtype)
+        dq = task_jacobian.T @ torch.linalg.solve(task_jacobian @ task_jacobian.T + damping, error)
+        desired = self._clip(self.arm_q() + dq.clamp(-0.15, 0.15))
+        max_delta = self.cfg.max_speed_rad_s * dt
+        cmd = self._clip(self._last_command + (desired - self._last_command).clamp(-max_delta, max_delta))
+        return cmd, pos_error.norm().item(), rot_error.norm().item()
+
+    def _step_pickup(self, dt):
+        if self.phase in (Phase.DONE, Phase.FAILED):
+            return self.joint_ids, self._last_command, self.phase
+        self.elapsed += dt
+        if self.elapsed > self.cfg.stage_timeout_s:
+            return self.joint_ids, self._fail(f"Pickup timeout in {self.phase.value}"), self.phase
+        goal, duration, next_phase = {
+            Phase.PRE_GRASP: (self._approach_world, 3.0, Phase.REACH),
+            Phase.REACH: (self._pickup_world, 1.5, Phase.CLOSE),
+            Phase.CLOSE: (self._pickup_world, 1.25, Phase.LIFT),
+            Phase.LIFT: (self._lift_world, 2.0, Phase.DONE),
+        }[self.phase]
+        u = min(1.0, self.elapsed / duration)
+        xyz = torch.lerp(self._phase_xyz_w, goal, u * u * (3.0 - 2.0 * u))
+        cmd, position_error, rotation_error = self._pickup_ik(xyz, dt)
+        if not bool(torch.isfinite(cmd).all()):
+            return self.joint_ids, self._fail("Non-finite pickup IK result"), self.phase
+        self._last_command = cmd
+        close_enough = position_error < self.cfg.reach_tolerance_m and rotation_error < 0.35
+        if self.phase == Phase.CLOSE:
+            # Torque-limited fingers can displace the wrist while contacting the fruit.
+            close_enough = position_error < 0.04 and rotation_error < 0.45
+        self.stable = self.stable + dt if u == 1.0 and close_enough else 0.0
+        if self.stable >= self.cfg.settle_s:
+            self._phase_xyz_w, _ = self.grasp_pose_w()
+            self._enter(next_phase)
+        return self.joint_ids, cmd, self.phase
 
     @property
     def failure_reason(self):
@@ -198,6 +292,8 @@ class G1LeftArmController:
         """
         if dt <= 0:
             raise ValueError("dt must be positive")
+        if self._pickup_world is not None:
+            return self._step_pickup(dt)
         if self.phase in (Phase.IDLE, Phase.DONE, Phase.FAILED):
             return self.joint_ids, self.arm_q(), self.phase
         self.elapsed += dt

@@ -22,6 +22,7 @@ class TargetVelocityCommand(UniformVelocityCommand):
                 raise ValueError("Target radius ranges must satisfy 0 <= min <= max <= 5 metres")
         # Public target variable: world XY coordinates, one target per robot.
         self.target_pos_w = self.robot.data.root_pos_w[:, :2].clone()
+        self._hold = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
         if cfg.external_target:
             self._target_received = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
         self.radius_range = tuple(cfg.initial_radius_range)
@@ -76,6 +77,7 @@ class TargetVelocityCommand(UniformVelocityCommand):
         self.metrics["yaw_rate_command"].copy_(self.vel_command_b[:, 2])
 
     def _resample_command(self, env_ids):
+        self._hold[env_ids] = False
         if self.cfg.external_target:
             self._target_received[env_ids] = False
             self.target_pos_w[env_ids] = self.robot.data.root_pos_w[env_ids, :2]
@@ -115,6 +117,11 @@ class TargetVelocityCommand(UniformVelocityCommand):
         self.target_pos_w[env_ids] = target_xy_w
         self._target_received[env_ids] = True
 
+    def hold_position(self, env_ids) -> None:
+        """Keep the observed target, but command zero translation and rotation until reset."""
+        self._hold[env_ids] = True
+        self.vel_command_b[env_ids] = 0.0
+
     def _update_target_yaw(self, env_ids, reset=False):
         error_w = self.target_pos_w[env_ids] - self.robot.data.root_pos_w[env_ids, :2]
         distance = torch.linalg.vector_norm(error_w, dim=-1)
@@ -138,6 +145,7 @@ class TargetVelocityCommand(UniformVelocityCommand):
             self.vel_command_b[:, 0] = (~reached) * self.cfg.ranges.lin_vel_x[1]
             if self.cfg.external_target:
                 self.vel_command_b[waiting] = 0.0
+            self.vel_command_b.masked_fill_(self._hold.unsqueeze(1), 0.0)
             return
 
         # Target stays fixed in world coordinates while the robot approaches.
@@ -145,6 +153,7 @@ class TargetVelocityCommand(UniformVelocityCommand):
         reached = torch.linalg.vector_norm(error_w, dim=-1) <= self.cfg.stop_distance
         if self.cfg.fixed_forward_distance is not None:
             self.vel_command_b[:, 0] = (~reached) * self.cfg.ranges.lin_vel_x[1]
+            self.vel_command_b.masked_fill_(self._hold.unsqueeze(1), 0.0)
             return
 
         error_b = self._error_in_yaw_frame(error_w, self._root_yaw(slice(None)))
@@ -165,6 +174,7 @@ class TargetVelocityCommand(UniformVelocityCommand):
         self.vel_command_b[:, :2] = velocity * scale.unsqueeze(-1)
         self.vel_command_b[:, 2] = 0.0  # Translate toward the target without commanding a turn.
         self.vel_command_b[reached] = 0.0
+        self.vel_command_b.masked_fill_(self._hold.unsqueeze(1), 0.0)
 
 
 @configclass

@@ -4,7 +4,6 @@ import isaaclab.sim as sim_utils
 import isaaclab.terrains as terrain_gen
 from isaaclab.assets import ArticulationCfg, AssetBaseCfg
 from isaaclab.envs import ManagerBasedRLEnvCfg
-from isaaclab.managers import CurriculumTermCfg as CurrTerm
 from isaaclab.managers import EventTermCfg as EventTerm
 from isaaclab.managers import ObservationGroupCfg as ObsGroup
 from isaaclab.managers import ObservationTermCfg as ObsTerm
@@ -162,22 +161,18 @@ class CommandsCfg:
 
     base_velocity = mdp.TargetVelocityCommandCfg(
         asset_name="robot",
-        target_xy=None,  # Random targets; set (x, y) for a fixed target relative to env origin.
-        initial_radius_range=(2.0, 3.0),
-        final_radius_range=(4.0, 5.0),
-        radius_increment=0.5,
-        position_gain=0.5,
-        stop_distance=0.2,
+        fixed_forward_distance=3.0,
+        stop_distance=0.3,
         resampling_time_range=(1.0e9, 1.0e9),  # One stationary target per episode.
         rel_standing_envs=0.0,
         rel_heading_envs=1.0,
         heading_command=False,
         debug_vis=True,
         ranges=mdp.UniformLevelVelocityCommandCfg.Ranges(
-            lin_vel_x=(-0.5, 0.5), lin_vel_y=(-0.3, 0.3), ang_vel_z=(-0.1, 0.1)
+            lin_vel_x=(0.5, 0.5), lin_vel_y=(0.0, 0.0), ang_vel_z=(0.0, 0.0)
         ),
         limit_ranges=mdp.UniformLevelVelocityCommandCfg.Ranges(
-            lin_vel_x=(-0.5, 1.0), lin_vel_y=(-0.3, 0.3), ang_vel_z=(-0.2, 0.2)
+            lin_vel_x=(0.5, 0.5), lin_vel_y=(0.0, 0.0), ang_vel_z=(0.0, 0.0)
         ),
     )
 
@@ -378,9 +373,9 @@ class TerminationsCfg:
 class CurriculumCfg:
     """Curriculum terms for the MDP."""
 
-    terrain_levels = CurrTerm(func=mdp.terrain_levels_vel)
-    lin_vel_cmd_levels = CurrTerm(mdp.lin_vel_cmd_levels)
-    target_radius_levels = CurrTerm(mdp.target_radius_levels)
+    terrain_levels = None
+    lin_vel_cmd_levels = None
+    target_radius_levels = None
 
 
 @configclass

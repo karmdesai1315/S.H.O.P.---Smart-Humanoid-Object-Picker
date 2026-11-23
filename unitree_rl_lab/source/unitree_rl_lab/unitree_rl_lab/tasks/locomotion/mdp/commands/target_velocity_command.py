@@ -32,17 +32,35 @@ class TargetVelocityCommand(UniformVelocityCommand):
                 self.cfg.target_xy, device=self.device
             )
         else:
-            radius_min, radius_max = self.radius_range
-            radius = torch.empty(len(env_ids), device=self.device).uniform_(radius_min, radius_max)
-            angle = torch.empty(len(env_ids), device=self.device).uniform_(-math.pi, math.pi)
-            offset = torch.stack((radius * torch.cos(angle), radius * torch.sin(angle)), dim=-1)
+            # Get robot's current heading
+            w, x, y, z = self.robot.data.root_quat_w[env_ids].unbind(dim=-1)
+            yaw = torch.atan2(2.0 * (w * z + x * y), 1.0 - 2.0 * (y * y + z * z))
+
+            if self.cfg.fixed_forward_distance is None:
+                radius_min, radius_max = self.radius_range
+                radius = torch.empty(len(env_ids), device=self.device).uniform_(radius_min, radius_max)
+                # Sample target within +/- 30 degrees of robot's forward direction
+                angle = torch.empty(len(env_ids), device=self.device).uniform_(-math.pi / 6, math.pi / 6)
+                heading = yaw + angle
+            else:
+                radius = self.cfg.fixed_forward_distance
+                heading = yaw
+
+            # Transform robot-relative target into world coordinates
+            offset = torch.stack((radius * torch.cos(heading), radius * torch.sin(heading)), dim=-1)
             # Sample around the robot's actual reset position, including reset jitter.
             self.target_pos_w[env_ids] = self.robot.data.root_pos_w[env_ids, :2] + offset
         self.vel_command_b[env_ids] = 0.0
+        if self.cfg.fixed_forward_distance is not None:
+            self.vel_command_b[env_ids, 0] = self.cfg.ranges.lin_vel_x[1]
 
     def _update_command(self):
         # Target stays fixed in world coordinates while the robot approaches.
         error_w = self.target_pos_w - self.robot.data.root_pos_w[:, :2]
+        reached = torch.linalg.vector_norm(error_w, dim=-1) <= self.cfg.stop_distance
+        if self.cfg.fixed_forward_distance is not None:
+            self.vel_command_b[:, 0] = (~reached) * self.cfg.ranges.lin_vel_x[1]
+            return
 
         # World XY error -> robot yaw frame (quaternions are w, x, y, z).
         w, x, y, z = self.robot.data.root_quat_w.unbind(dim=-1)
@@ -69,7 +87,6 @@ class TargetVelocityCommand(UniformVelocityCommand):
         )
         self.vel_command_b[:, :2] = velocity * scale.unsqueeze(-1)
         self.vel_command_b[:, 2] = 0.0  # Translate toward the target without commanding a turn.
-        reached = torch.linalg.vector_norm(error_w, dim=-1) <= self.cfg.stop_distance
         self.vel_command_b[reached] = 0.0
 
 
@@ -77,6 +94,7 @@ class TargetVelocityCommand(UniformVelocityCommand):
 class TargetVelocityCommandCfg(UniformLevelVelocityCommandCfg):
     class_type: type = TargetVelocityCommand
     target_xy: tuple[float, float] | None = None  # None=random; (x,y)=fixed relative to env origin
+    fixed_forward_distance: float | None = None  # metres ahead at reset, with constant forward speed
     target_height: float = 0.0  # metres relative to env origin, for pose observation only
     target_orientation: tuple[float, float, float, float] = (1.0, 0.0, 0.0, 0.0)  # world w,x,y,z
     initial_radius_range: tuple[float, float] = (2.0, 3.0)  # metres from robot at reset

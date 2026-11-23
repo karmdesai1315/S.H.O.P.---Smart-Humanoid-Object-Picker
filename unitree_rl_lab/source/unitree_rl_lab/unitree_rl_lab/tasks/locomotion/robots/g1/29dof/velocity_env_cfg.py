@@ -161,7 +161,9 @@ class CommandsCfg:
 
     base_velocity = mdp.TargetVelocityCommandCfg(
         asset_name="robot",
-        fixed_forward_distance=3.0,
+        initial_radius_range=(2.0, 5.0),
+        target_angle_range=(-math.pi, math.pi),
+        yaw_gain=1.0,
         stop_distance=0.3,
         resampling_time_range=(1.0e9, 1.0e9),  # One stationary target per episode.
         rel_standing_envs=0.0,
@@ -169,10 +171,10 @@ class CommandsCfg:
         heading_command=False,
         debug_vis=True,
         ranges=mdp.UniformLevelVelocityCommandCfg.Ranges(
-            lin_vel_x=(0.5, 0.5), lin_vel_y=(0.0, 0.0), ang_vel_z=(0.0, 0.0)
+            lin_vel_x=(0.0, 0.0), lin_vel_y=(0.0, 0.0), ang_vel_z=(-0.5, 0.5)
         ),
         limit_ranges=mdp.UniformLevelVelocityCommandCfg.Ranges(
-            lin_vel_x=(0.5, 0.5), lin_vel_y=(0.0, 0.0), ang_vel_z=(0.0, 0.0)
+            lin_vel_x=(0.0, 0.0), lin_vel_y=(0.0, 0.0), ang_vel_z=(-0.5, 0.5)
         ),
     )
 
@@ -262,11 +264,8 @@ class RewardsCfg:
     )
 
     # -- task
-    track_lin_vel_xy = RewTerm(
-        func=mdp.track_lin_vel_xy_yaw_frame_exp,
-        weight=1.0,
-        params={"command_name": "base_velocity", "std": math.sqrt(0.25)},
-    )
+    target_distance = RewTerm(func=mdp.target_distance_reward, weight=3.0, params={"beta": 0.1})
+    target_stop = RewTerm(func=mdp.target_stop_reward, weight=2.0, params={"std": 0.1})
     track_ang_vel_z = RewTerm(
         func=mdp.track_ang_vel_z_exp, weight=0.5, params={"command_name": "base_velocity", "std": math.sqrt(0.25)}
     )
@@ -327,6 +326,7 @@ class RewardsCfg:
             "offset": [0.0, 0.5],
             "threshold": 0.55,
             "command_name": "base_velocity",
+            "use_target_distance": True,
             "sensor_cfg": SceneEntityCfg("contact_forces", body_names=".*ankle_roll.*"),
         },
     )

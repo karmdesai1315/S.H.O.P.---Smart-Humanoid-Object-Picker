@@ -19,7 +19,7 @@ from isaaclab.utils.assets import ISAAC_NUCLEUS_DIR, ISAACLAB_NUCLEUS_DIR
 from isaaclab.utils.noise import AdditiveUniformNoiseCfg as Unoise
 
 from unitree_rl_lab.assets.robots.unitree import UNITREE_G1_29DOF_CFG as ROBOT_CFG
-from unitree_rl_lab.assets.robots.unitree import g1_inspire_cfg, g1_policy_joint_order
+from unitree_rl_lab.assets.robots.unitree import INSPIRE_LEFT_GRASP, g1_inspire_cfg, g1_policy_joint_order
 from unitree_rl_lab.tasks.locomotion import mdp
 
 COBBLESTONE_ROAD_CFG = terrain_gen.TerrainGeneratorCfg(
@@ -368,16 +368,18 @@ class PickupJointPositionAction(mdp.JointPositionAction):
         self._arm_ids = [self._asset.joint_names.index(name) for name in names]
         self._arm_columns = [self._joint_ids.index(joint_id) for joint_id in self._arm_ids]
         self.active = torch.zeros(env.num_envs, dtype=torch.bool, device=env.device)
-        self.anchor_xy = self._asset.data.root_pos_w[:, :2].clone()
         self._arm_targets = self._asset.data.joint_pos[:, self._arm_ids].clone()
         self._arm_start = self._arm_targets.clone()
         self._elapsed = torch.zeros(env.num_envs, device=env.device)
         self._settled = torch.zeros_like(self._elapsed)
-        self._reach = self._arm_targets.new_tensor(cfg.balance_reach)
+        if cfg.train_balance:
+            self._trajectory = self._arm_targets.new_tensor(cfg.balance_trajectory)
+            self._finger_ids = [self._asset.joint_names.index(name) for name in INSPIRE_LEFT_GRASP]
+            self._closed = self._arm_targets.new_tensor(list(INSPIRE_LEFT_GRASP.values()))
+            self._finger_targets = self._closed.new_zeros((env.num_envs, len(self._finger_ids)))
 
     def begin_pickup(self, env_ids):
         self.active[env_ids] = True
-        self.anchor_xy[env_ids] = self._asset.data.root_pos_w[env_ids, :2]
         self._arm_start[env_ids] = self._asset.data.joint_pos[env_ids][:, self._arm_ids]
         self._arm_targets[env_ids] = self._arm_start[env_ids]
         self._env.command_manager.get_term("base_velocity").hold_position(env_ids)
@@ -391,17 +393,23 @@ class PickupJointPositionAction(mdp.JointPositionAction):
             return
         command = self._env.command_manager.get_term("base_velocity")
         speed = self._asset.data.root_lin_vel_w[:, :2].norm(dim=-1)
-        aligned = command.metrics["target_yaw_error"].abs() < math.radians(8)
-        turning_slowly = self._asset.data.root_ang_vel_w[:, 2].abs() < 0.1
-        ready = (command.target_distance <= command.cfg.stop_distance) & (speed < 0.08) & aligned & turning_slowly
+        aligned = command.metrics["target_yaw_error"].abs() < math.radians(15)
+        turning_slowly = self._asset.data.root_ang_vel_w[:, 2].abs() < 0.3
+        ready = (command.target_distance <= command.cfg.stop_distance) & (speed < 0.05) & aligned & turning_slowly
         dt = self._env.step_dt
         self._settled = torch.where(ready, self._settled + dt, 0.0)
-        self.begin_pickup((~self.active & (self._settled >= 0.4)).nonzero(as_tuple=True)[0])
+        self.begin_pickup((~self.active & (self._settled >= 0.5)).nonzero(as_tuple=True)[0])
+        frame = (self._elapsed / self.cfg.balance_sample_dt).clamp(max=len(self._trajectory) - 1)
+        previous = frame.long()
+        following = (previous + 1).clamp(max=len(self._trajectory) - 1)
+        reference = torch.lerp(
+            self._trajectory[previous], self._trajectory[following], (frame - previous).unsqueeze(-1)
+        )
+        blend = (self._elapsed / 1.0).clamp(0.0, 1.0).unsqueeze(-1)
+        blend = blend.square() * (3.0 - 2.0 * blend)
+        self._arm_targets[:] = torch.lerp(self._arm_start, reference[:, :7], blend)
+        self._finger_targets[:] = (reference[:, 7] * self.active).unsqueeze(-1) * self._closed
         self._elapsed += dt * self.active
-        # Apply a slow, sustained reach/lift disturbance so PPO experiences arm load shifts.
-        phase = (self._elapsed / 2.5).clamp(0.0, 1.0).unsqueeze(-1)
-        blend = phase.square() * (3.0 - 2.0 * phase)
-        self._arm_targets[:] = torch.lerp(self._arm_start, self._reach, blend)
 
     def apply_actions(self):
         super().apply_actions()
@@ -410,6 +418,7 @@ class PickupJointPositionAction(mdp.JointPositionAction):
                 self.active.unsqueeze(1), self._arm_targets, self.processed_actions[:, self._arm_columns]
             )
             self._asset.set_joint_position_target(targets, joint_ids=self._arm_ids)
+            self._asset.set_joint_position_target(self._finger_targets, joint_ids=self._finger_ids)
         elif self.active[0]:
             self._asset.set_joint_position_target(self._arm_targets, joint_ids=self._arm_ids)
 
@@ -425,7 +434,8 @@ class PickupJointPositionAction(mdp.JointPositionAction):
 class PickupJointPositionActionCfg(mdp.JointPositionActionCfg):
     class_type: type = PickupJointPositionAction
     train_balance: bool = False
-    balance_reach: tuple[float, ...] = (-0.75, 0.20, 0.0, 0.35, 0.0, 0.10, 0.0)
+    balance_trajectory: list[list[float]] | None = None
+    balance_sample_dt: float = 0.02
 
 
 @configclass
@@ -643,11 +653,12 @@ class RobotEnvCfg(ManagerBasedRLEnvCfg):
     events: EventCfg = EventCfg()
     curriculum: CurriculumCfg = CurriculumCfg()
 
-    def enable_inspire(self, urdf_path=None, checkpoint=None, train_balance=False):
+    def enable_inspire(self, urdf_path=None, checkpoint=None, *, balance_trace=None, drift_weight=-0.5):
         """Swap the articulation while keeping the Stage 1 policy's 29 body joints."""
         self.scene.robot = g1_inspire_cfg(urdf_path).replace(prim_path="{ENV_REGEX_NS}/Robot")
         names, preserve_order = g1_policy_joint_order(checkpoint)
         joint_action = self.actions.JointPositionAction
+        train_balance = balance_trace is not None
         self.actions.JointPositionAction = PickupJointPositionActionCfg(
             asset_name=joint_action.asset_name,
             joint_names=names,
@@ -664,7 +675,12 @@ class RobotEnvCfg(ManagerBasedRLEnvCfg):
                     "robot", joint_names=names, preserve_order=preserve_order
                 )
         if train_balance:
-            self.rewards.pickup_drift = RewTerm(func=mdp.pickup_base_drift, weight=-0.5)
+            self.actions.JointPositionAction.balance_trajectory = balance_trace["samples"]
+            self.actions.JointPositionAction.balance_sample_dt = balance_trace["dt"]
+            self.commands.base_velocity.near_target_fraction = 0.5
+            trace_duration = (len(balance_trace["samples"]) - 1) * balance_trace["dt"]
+            self.episode_length_s = max(self.episode_length_s, 16.0 + trace_duration)
+            self.rewards.pickup_drift = RewTerm(func=mdp.pickup_base_drift, weight=drift_weight)
 
     def __post_init__(self):
         """Post initialization."""

@@ -23,6 +23,8 @@ for task_spec in gym.registry.values():
         tasks.append(task_spec.id)
 
 import argparse
+import json
+import math
 
 import argcomplete
 
@@ -40,7 +42,9 @@ parser.add_argument("--num_envs", type=int, default=None, help="Number of enviro
 parser.add_argument("--task", type=str, default=None, choices=tasks, help="Name of the task.")
 parser.add_argument("--seed", type=int, default=None, help="Seed used for the environment")
 parser.add_argument("--max_iterations", type=int, default=None, help="RL Policy training iterations.")
-parser.add_argument("--pickup_balance", action="store_true", help="Fine-tune G1 balance during a scripted left-arm reach.")
+parser.add_argument("--pickup_balance", action="store_true", help="Fine-tune G1 balance during a recorded reach and lift.")
+parser.add_argument("--pickup_trace", type=pathlib.Path, help="Successful fixed-base pickup trace from play_yolo.py.")
+parser.add_argument("--pickup_drift_weight", type=float, default=-0.5, help="Pickup-only drift penalty weight.")
 parser.add_argument("--inspire_urdf", help="Path to the G1 Inspire DFQ URDF for balance fine-tuning.")
 parser.add_argument(
     "--distributed", action="store_true", default=False, help="Run training with multiple GPUs or nodes."
@@ -51,6 +55,13 @@ cli_args.add_rsl_rl_args(parser)
 AppLauncher.add_app_launcher_args(parser)
 argcomplete.autocomplete(parser)
 args_cli, hydra_args = parser.parse_known_args()
+if args_cli.pickup_balance:
+    if args_cli.task != "Unitree-G1-29dof-Velocity" or not args_cli.checkpoint or not args_cli.pickup_trace:
+        parser.error("--pickup_balance requires the G1 velocity task, --checkpoint, and --pickup_trace")
+    if not math.isfinite(args_cli.pickup_drift_weight) or args_cli.pickup_drift_weight >= 0:
+        parser.error("--pickup_drift_weight must be finite and negative")
+elif args_cli.pickup_trace:
+    parser.error("--pickup_trace requires --pickup_balance")
 
 # always enable cameras to record video
 if args_cli.video:
@@ -120,6 +131,24 @@ torch.backends.cudnn.deterministic = False
 torch.backends.cudnn.benchmark = False
 
 
+def load_pickup_trace(path):
+    with path.open(encoding="utf-8") as file:
+        trace = json.load(file)
+    try:
+        dt = float(trace["dt"])
+        samples = torch.as_tensor(trace["samples"], dtype=torch.float32)
+    except (KeyError, TypeError, ValueError) as error:
+        raise ValueError(f"Invalid pickup trace: {path}") from error
+    if (
+        not math.isfinite(dt) or dt <= 0
+        or samples.ndim != 2 or samples.shape[0] < 2 or samples.shape[1] != 8
+        or not torch.isfinite(samples).all()
+        or not ((samples[:, 7] >= 0) & (samples[:, 7] <= 1)).all()
+    ):
+        raise ValueError(f"Pickup trace needs a positive timestep and finite rows of 7 arm targets plus finger closure: {path}")
+    return {"dt": dt, "samples": samples.tolist()}
+
+
 @hydra_task_config(args_cli.task, "rsl_rl_cfg_entry_point")
 def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agent_cfg: RslRlOnPolicyRunnerCfg):
     """Train with RSL-RL agent."""
@@ -158,10 +187,13 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     log_dir = os.path.join(log_root_path, log_dir)
 
     if args_cli.pickup_balance:
-        if args_cli.task != "Unitree-G1-29dof-Velocity" or not args_cli.checkpoint:
-            raise ValueError("--pickup_balance requires the G1 velocity task and a Stage 1 --checkpoint path")
         resume_path = retrieve_file_path(args_cli.checkpoint)
-        env_cfg.enable_inspire(args_cli.inspire_urdf, resume_path, train_balance=True)
+        env_cfg.enable_inspire(
+            args_cli.inspire_urdf,
+            resume_path,
+            balance_trace=load_pickup_trace(args_cli.pickup_trace),
+            drift_weight=args_cli.pickup_drift_weight,
+        )
     elif agent_cfg.resume or agent_cfg.algorithm.class_name == "Distillation":
         resume_path = get_checkpoint_path(log_root_path, agent_cfg.load_run, agent_cfg.load_checkpoint)
 

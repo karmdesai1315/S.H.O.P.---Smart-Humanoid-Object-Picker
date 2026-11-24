@@ -82,6 +82,7 @@ class G1LeftArmController:
         self._target_xyz = None
         self._failure_reason = None
         self._pickup_world = None
+        self.tracking_error = None
 
     def _find_arm_joints(self):
         names = list(self.robot.joint_names)
@@ -120,13 +121,11 @@ class G1LeftArmController:
         return _rotation_inverse(torso_q, wrist_p - torso_p)
 
     def _jacobian_torso(self):
-        # PhysX view: fixed base (N, B, 6, J), floating base
-        # (N, B-1, 6, J+6). For floating base, root body is omitted.
         jac = self.robot.root_physx_view.get_jacobians()
         offset = jac.shape[-1] - self.robot.num_joints
         if offset not in (0, 6):
             raise RuntimeError(f"Unexpected PhysX Jacobian joint offset {offset}")
-        body_offset = 1 if offset == 6 else 0
+        body_offset = len(self.robot.body_names) - jac.shape[1]
         wrist_row = self.wrist_id - body_offset
         torso_row = self.torso_id - body_offset
         if wrist_row < 0 or wrist_row >= jac.shape[1]:
@@ -201,7 +200,9 @@ class G1LeftArmController:
         self._grasp_offset = self._pickup_world.new_tensor((0.185, -0.025, 0.0))
         self._approach_world = self._pickup_world + self._pickup_world.new_tensor((0.0, 0.0, 0.07))
         self._lift_world = self._pickup_world + self._pickup_world.new_tensor((0.0, 0.0, self.cfg.lift_m))
-        self._phase_xyz_w, _ = self.grasp_pose_w()
+        self._phase_xyz_w, start_quat = self.grasp_pose_w()
+        self._start_grasp_quat = torch.where((start_quat * self._grasp_quat).sum() < 0, -start_quat, start_quat)
+        self.tracking_error = None
 
     def grasp_pose_w(self):
         """Position of the Inspire grasp center and orientation of the wrist link."""
@@ -218,17 +219,21 @@ class G1LeftArmController:
             return min(1.0, self.elapsed / 1.0)
         return float(self.phase in (Phase.LIFT, Phase.DONE))
 
-    def _pickup_ik(self, xyz, dt):
+    def _pickup_ik(self, xyz, goal_quat, dt):
         from isaaclab.utils.math import compute_pose_error
 
         point, quat = self.grasp_pose_w()
         pos_error, rot_error = compute_pose_error(
-            point.unsqueeze(0), quat.unsqueeze(0), xyz.unsqueeze(0), self._grasp_quat.unsqueeze(0),
+            point.unsqueeze(0), quat.unsqueeze(0), xyz.unsqueeze(0), goal_quat.unsqueeze(0),
             rot_error_type="axis_angle",
         )
         jacobians = self.robot.root_physx_view.get_jacobians()
         col_offset = jacobians.shape[-1] - self.robot.num_joints
-        row = self.wrist_id - int(not self.robot.is_fixed_base)
+        # Fixed-base PhysX Jacobians omit the root body.
+        body_offset = len(self.robot.body_names) - jacobians.shape[1]
+        row = self.wrist_id - body_offset
+        if body_offset not in (0, 1) or col_offset not in (0, 6) or not 0 <= row < jacobians.shape[1]:
+            raise RuntimeError(f"Unexpected wrist Jacobian layout {tuple(jacobians.shape)}")
         columns = [index + col_offset for index in self.joint_ids]
         jacobian = jacobians[self.env_id, row, :, :][:, columns]
         # PhysX returns a COM-referenced Jacobian. Shift it to the grasp center.
@@ -258,8 +263,14 @@ class G1LeftArmController:
             Phase.LIFT: (self._lift_world, 2.0, Phase.DONE),
         }[self.phase]
         u = min(1.0, self.elapsed / duration)
-        xyz = torch.lerp(self._phase_xyz_w, goal, u * u * (3.0 - 2.0 * u))
-        cmd, position_error, rotation_error = self._pickup_ik(xyz, dt)
+        blend = u * u * (3.0 - 2.0 * u)
+        xyz = torch.lerp(self._phase_xyz_w, goal, blend)
+        goal_quat = self._grasp_quat
+        if self.phase == Phase.PRE_GRASP:
+            goal_quat = torch.lerp(self._start_grasp_quat, goal_quat, blend)
+            goal_quat = goal_quat / goal_quat.norm()
+        cmd, position_error, rotation_error = self._pickup_ik(xyz, goal_quat, dt)
+        self.tracking_error = (position_error, rotation_error)
         if not bool(torch.isfinite(cmd).all()):
             return self.joint_ids, self._fail("Non-finite pickup IK result"), self.phase
         self._last_command = cmd

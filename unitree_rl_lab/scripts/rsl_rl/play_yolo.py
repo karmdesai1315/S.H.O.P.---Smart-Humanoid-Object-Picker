@@ -5,6 +5,7 @@ Use --show to display detections in a desktop session.
 """
 
 import argparse
+import json
 import math
 import sys
 from importlib.metadata import version
@@ -22,14 +23,24 @@ parser.add_argument("--detect_every", type=int, default=5, help="Steps between d
 parser.add_argument("--show", action="store_true", help="Show the head-camera detections.")
 parser.add_argument("--inspire_urdf", help="Path to the G1 Inspire DFQ URDF in unitree_ros.")
 parser.add_argument("--walk_only", action="store_true", help="Run the aisle demo with the original walking robot.")
+parser.add_argument("--ik_diagnostic", action="store_true", help="Test one fixed-base grasp using the simulated banana pose.")
+parser.add_argument("--record_pickup_trace", type=Path, help="Save a successful diagnostic's arm and finger commands for training.")
+parser.add_argument("--pickup_debug", action="store_true", help="Print tracking errors and left-arm contacts during pickup.")
+parser.add_argument("--pickup_standoff", type=float, default=0.45, help="Across-aisle approach offset in metres.")
 cli_args.add_rsl_rl_args(parser)
 AppLauncher.add_app_launcher_args(parser)
 args = parser.parse_args()
-if not args.checkpoint:
-    parser.error("--checkpoint must point to the trained Stage 1 policy")
+if not args.checkpoint and not args.ik_diagnostic:
+    parser.error("--checkpoint must point to a trained walking or pickup-balance policy")
+if args.ik_diagnostic and (args.walk_only or args.show or args.target.strip().lower() != "banana"):
+    parser.error("--ik_diagnostic tests the banana directly and cannot be combined with --walk_only or --show")
+if args.record_pickup_trace and not args.ik_diagnostic:
+    parser.error("--record_pickup_trace requires --ik_diagnostic")
+if not math.isfinite(args.pickup_standoff) or args.pickup_standoff <= 0:
+    parser.error("--pickup_standoff must be positive and finite")
 if args.detect_every < 1:
     parser.error("--detect_every must be at least 1")
-args.enable_cameras = True
+args.enable_cameras = not args.ik_diagnostic
 simulation_app = AppLauncher(args).app
 
 import cv2
@@ -44,6 +55,7 @@ import unitree_rl_lab.tasks  # noqa: F401
 from isaaclab.utils.assets import retrieve_file_path
 from isaaclab.utils.math import quat_apply
 from isaaclab_rl.rsl_rl import RslRlVecEnvWrapper
+from unitree_rl_lab.assets.robots.unitree import INSPIRE_LEFT_GRASP
 from unitree_rl_lab.utils.parser_cfg import parse_env_cfg
 
 TASK = "Unitree-G1-29dof-Velocity"
@@ -51,7 +63,6 @@ TARGET_SAMPLES = 2  # lock the target on the first detection with valid depth
 TARGET_SPREAD_M = 0.15
 SETTLE_SECONDS = 0.5
 # Stop in the aisle in front of the object instead of walking straight at it (it sits inside the shelf).
-APPROACH_STANDOFF_M = 0.45  # robot pelvis to object, measured across the aisle
 APPROACH_STOP_M = 0.20  # how close to the approach spot counts as "there"
 
 
@@ -119,21 +130,16 @@ class BananaPickup:
         self.robot = env.scene["robot"]
         self.banana = env.scene["target_object"]
         self.action = env.action_manager.get_term("JointPositionAction")
+        self.command = env.command_manager.get_term("base_velocity")
+        self.contact_sensor = env.scene["contact_forces"]
+        self.arm_contact_ids, _ = self.contact_sensor.find_bodies(
+            r"left_(shoulder|elbow|wrist).*|L_.*"
+        )
         self.arm = G1LeftArmController(
             self.robot, config=ArmConfig(max_speed_rad_s=0.40, reach_tolerance_m=0.022, lift_m=0.09)
         )
-        # Same Inspire power-grasp angles and linkage ratios as the earlier hand demo.
-        angles = {
-            "thumb_proximal_yaw_joint": 1.10,
-            "thumb_proximal_pitch_joint": 0.45,
-            "thumb_intermediate_joint": 0.45 * 1.6,
-            "thumb_distal_joint": 0.45 * 2.4,
-        }
-        for finger in ("index", "middle", "ring", "pinky"):
-            angles[f"{finger}_proximal_joint"] = 1.40
-            angles[f"{finger}_intermediate_joint"] = 1.40
-        self.finger_ids = [self.robot.joint_names.index(f"L_{name}") for name in angles]
-        self.closed = self.robot.data.joint_pos.new_tensor(list(angles.values())).unsqueeze(0)
+        self.finger_ids = [self.robot.joint_names.index(name) for name in INSPIRE_LEFT_GRASP]
+        self.closed = self.robot.data.joint_pos.new_tensor(list(INSPIRE_LEFT_GRASP.values())).unsqueeze(0)
         self.reset()
 
     def reset(self):
@@ -143,6 +149,8 @@ class BananaPickup:
         self.done_time = 0.0
         self.result_printed = False
         self.closure = 0.0
+        self.debug_elapsed = 0.0
+        self.peak_drift = self.closed.new_zeros(())
 
     def start(self, goal, heading):
         self.arm.start_pickup(goal, heading)
@@ -161,13 +169,20 @@ class BananaPickup:
             self.closure = self.arm.finger_closure
         self.action.set_arm_targets([0], q_target)
         self.robot.set_joint_position_target(self.closed * self.closure, joint_ids=self.finger_ids)
+        drift = (self.robot.data.root_pos_w[0, :2] - self.command.hold_xy_w[0]).norm()
+        self.peak_drift = torch.maximum(self.peak_drift, drift)
         if phase != phase_before:
             print(f"[PICKUP] {phase.value}")
+        if (args.pickup_debug or args.ik_diagnostic) and not self.result_printed:
+            self.debug_elapsed += dt
+            if self.debug_elapsed >= 0.5 or phase != phase_before:
+                self.report_tracking(phase)
+                self.debug_elapsed = 0.0
         if self.result_printed:
-            return
+            return q_target
         if phase == self.Phase.FAILED:
             self.result_printed = True
-            print(f"[PICKUP] {self.arm.failure_reason}")
+            print(f"[PICKUP] {self.arm.failure_reason}. Peak base drift: {self.peak_drift.item():.3f} m.")
         elif phase == self.Phase.DONE:
             self.done_time += dt
             fruit = self.banana.data.root_pos_w[0]
@@ -176,10 +191,28 @@ class BananaPickup:
             holding = lift >= 0.045 and (fruit - center).norm().item() < 0.13
             self.lift_hold = self.lift_hold + dt if holding else 0.0
             if self.lift_hold >= 0.4 or self.done_time >= 2.0:
-                drift = (self.robot.data.root_pos_w[0, :2] - self.action.anchor_xy[0]).norm().item()
                 status = "Picked up banana" if self.lift_hold >= 0.4 else "Grasp not verified"
-                print(f"[PICKUP] {status}. Banana lift: {lift:.3f} m. Base drift: {drift:.3f} m.")
+                print(f"[PICKUP] {status}. Banana lift: {lift:.3f} m. Peak base drift: {self.peak_drift.item():.3f} m.")
                 self.result_printed = True
+        return q_target
+
+    def report_tracking(self, phase):
+        if self.arm.tracking_error is None:
+            return
+        pos, rot = self.arm.tracking_error
+        lower, upper = self.robot.data.soft_joint_pos_limits[0, self.arm.joint_ids].unbind(dim=-1)
+        q = self.arm.arm_q()
+        near_limit = ((q - lower < 0.03) | (upper - q < 0.03)).sum().item()
+        contact_peak = 0.0
+        if self.arm_contact_ids:
+            forces = self.contact_sensor.data.net_forces_w_history[0, :, self.arm_contact_ids]
+            contact_peak = forces.norm(dim=-1).amax().item()
+        yaw_error = math.remainder((self.command.hold_yaw_w[0] - self.command._root_yaw([0])[0]).item(), math.tau)
+        print(
+            f"[PICKUP DEBUG] {phase.value} pos={pos:.3f} m rot={math.degrees(rot):.1f} deg "
+            f"joints_near_limit={near_limit} arm_contact={contact_peak:.1f} N "
+            f"peak_drift={self.peak_drift.item():.3f} m yaw_error={math.degrees(yaw_error):+.1f} deg"
+        )
 
 
 def walk_to_detection(env, policy, model, target_class, pickup=None):
@@ -260,7 +293,7 @@ def walk_to_detection(env, policy, model, target_class, pickup=None):
                     # Walk to a spot in the aisle in front of the object (on the aisle side of it).
                     side = 1.0 if (goal[1] - scene.env_origins[0, 1]).item() >= 0.0 else -1.0
                     approach = goal[:2].clone()
-                    approach[1] -= side * APPROACH_STANDOFF_M
+                    approach[1] -= side * args.pickup_standoff
                     command.cfg.stop_distance = APPROACH_STOP_M
                     command.set_target_xy([0], approach)
                     print(f"[AISLE] Walking to the spot in front of it: XY={approach.tolist()}")
@@ -300,8 +333,8 @@ def walk_to_detection(env, policy, model, target_class, pickup=None):
                     print(
                         f"[DEBUG] dist={distance:.2f} (need <= {command.cfg.stop_distance:.2f})  "
                         f"speed={xy_speed:.3f} (need < 0.05)  "
-                        f"yaw_err={math.degrees(yaw_error):.1f} deg (need < 8)  "
-                        f"yaw_rate={yaw_rate:.2f} (need < 0.1)"
+                        f"yaw_err={math.degrees(yaw_error):.1f} deg (need < 15)  "
+                        f"yaw_rate={yaw_rate:.2f} (need < 0.3)"
                     )
                 settled = (
                     distance <= command.cfg.stop_distance
@@ -326,22 +359,66 @@ def walk_to_detection(env, policy, model, target_class, pickup=None):
                         print(f"[AISLE] Distance to the banana USD origin: {banana_distance:.3f} m.")
 
 
+@torch.inference_mode()
+def run_ik_diagnostic(env, heading):
+    env.reset()
+    pickup = BananaPickup(env)
+    if not pickup.robot.is_fixed_base:
+        raise RuntimeError("IK diagnostic requires a fixed-base Inspire articulation")
+    zeros = torch.zeros((env.num_envs, env.action_manager.total_action_dim), device=env.device)
+    dt = env.step_dt
+    for _ in range(math.ceil(SETTLE_SECONDS / dt)):
+        env.step(zeros)
+    pickup.start(pickup.banana.data.root_pos_w[0], heading)
+    samples = []
+    while simulation_app.is_running():
+        q_target = pickup.step(dt)
+        if args.record_pickup_trace:
+            samples.append(torch.cat((q_target, q_target.new_tensor([pickup.closure]))))
+        if pickup.result_printed:
+            if pickup.lift_hold < 0.4:
+                raise RuntimeError("Fixed-base pickup failed. Check the phase and tracking log above.")
+            if args.record_pickup_trace:
+                with args.record_pickup_trace.open("x", encoding="utf-8") as file:
+                    json.dump({"dt": dt, "samples": torch.stack(samples).cpu().tolist()}, file)
+                print(f"[PICKUP] Saved training trace to {args.record_pickup_trace}")
+            return
+        _, _, terminated, timed_out, _ = env.step(zeros)
+        if terminated[0].item() or timed_out[0].item():
+            raise RuntimeError("Fixed-base diagnostic reset before pickup completed")
+
+
 def main():
     args.target = args.target.strip().lower()
     if not args.walk_only and args.target != "banana":
         raise ValueError("Pickup is configured for banana. Use --walk_only to approach another class.")
+    env_cfg = parse_env_cfg(TASK, device=args.device, entry_point_key="play_env_cfg_entry_point")
+    checkpoint = retrieve_file_path(args.checkpoint) if args.checkpoint else None
+    env_cfg.enable_aisle(pickup=not args.walk_only)
+    if not args.walk_only:
+        env_cfg.enable_inspire(args.inspire_urdf, checkpoint)
+    if args.ik_diagnostic:
+        env_cfg.scene.head_camera = None
+        robot_cfg = env_cfg.scene.robot
+        robot_cfg.spawn.fix_base = True
+        x, y, _ = env_cfg.scene.target_object.init_state.pos
+        heading = math.copysign(math.pi / 2, y)
+        robot_cfg.init_state.pos = (x, y - math.copysign(args.pickup_standoff, y), robot_cfg.init_state.pos[2])
+        robot_cfg.init_state.rot = (math.cos(heading / 2), 0.0, 0.0, math.sin(heading / 2))
+        env = gym.make(TASK, cfg=env_cfg)
+        try:
+            run_ik_diagnostic(env.unwrapped, heading)
+        finally:
+            env.close()
+        return
+
     model = YOLO(args.yolo_model)
     target_class = next((index for index, name in model.names.items() if name == args.target), None)
     if target_class is None:
         raise ValueError(f"YOLO weights {args.yolo_model!r} do not contain class {args.target!r}")
 
-    env_cfg = parse_env_cfg(TASK, device=args.device, entry_point_key="play_env_cfg_entry_point")
-    checkpoint = retrieve_file_path(args.checkpoint)
-    env_cfg.enable_aisle(pickup=not args.walk_only)
-    if not args.walk_only:
-        env_cfg.enable_inspire(args.inspire_urdf, checkpoint)
     agent_cfg = cli_args.parse_rsl_rl_cfg(TASK, args)
-    print(f"[INFO] Loading Stage 1 checkpoint: {checkpoint}")
+    print(f"[INFO] Loading policy checkpoint: {checkpoint}")
     env = gym.make(TASK, cfg=env_cfg)
     try:
         env = RslRlVecEnvWrapper(env, clip_actions=agent_cfg.clip_actions)

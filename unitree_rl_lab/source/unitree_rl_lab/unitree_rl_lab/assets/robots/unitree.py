@@ -22,6 +22,17 @@ UNITREE_MODEL_DIR = "path/to/unitree_model"  # Replace with the actual path to y
 UNITREE_ROS_DIR = "path/to/unitree_ros"  # Replace with the actual path to your unitree_ros package
 
 INSPIRE_URDF_NAME = "g1_29dof_rev_1_0_with_inspire_hand_DFQ.urdf"
+INSPIRE_LEFT_GRASP = {
+    "L_thumb_proximal_yaw_joint": 1.10,
+    "L_thumb_proximal_pitch_joint": 0.45,
+    "L_thumb_intermediate_joint": 0.45 * 1.6,
+    "L_thumb_distal_joint": 0.45 * 2.4,
+    **{
+        f"L_{finger}_{joint}_joint": 1.40
+        for finger in ("index", "middle", "ring", "pinky")
+        for joint in ("proximal", "intermediate")
+    },
+}
 
 
 def g1_inspire_cfg(urdf_path: str | None = None):

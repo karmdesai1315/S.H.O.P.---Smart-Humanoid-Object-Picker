@@ -329,7 +329,9 @@ class CommandsCfg:
         initial_radius_range=(2.0, 5.0),
         target_angle_range=(-math.pi, math.pi),
         yaw_gain=1.0,
-        stop_distance=0.3,
+        stop_distance=0.5,
+        near_target_fraction=0.3,  # 30% of episodes: target starts 0.25-0.45 m away, turn on the spot to face it
+        near_radius_range=(0.25, 0.45),
         resampling_time_range=(1.0e9, 1.0e9),  # One stationary target per episode.
         rel_standing_envs=0.0,
         rel_heading_envs=1.0,
@@ -506,6 +508,13 @@ class RewardsCfg:
     # -- task
     target_distance = RewTerm(func=mdp.target_distance_reward, weight=3.0, params={"beta": 0.1})
     target_stop = RewTerm(func=mdp.target_stop_reward, weight=2.0, params={"std": 0.1})
+    target_heading = RewTerm(func=mdp.target_heading_reward, weight=1.5, params={"std": 0.5})
+    # follow the 0.5 m/s forward command (the v05 checkpoint was trained with this)
+    track_lin_vel_xy = RewTerm(
+        func=mdp.track_lin_vel_xy_yaw_frame_exp,
+        weight=1.0,
+        params={"command_name": "base_velocity", "std": math.sqrt(0.25)},
+    )
     track_ang_vel_z = RewTerm(
         func=mdp.track_ang_vel_z_exp, weight=0.5, params={"command_name": "base_velocity", "std": math.sqrt(0.25)}
     )
@@ -703,6 +712,7 @@ class RobotPlayEnvCfg(RobotEnvCfg):
             contact_forces=self.scene.contact_forces,
             sky_light=self.scene.sky_light,
         )
+        self.commands.base_velocity.yaw_gain = 2.0
         self.scene.terrain.terrain_type = "plane"
         self.scene.terrain.terrain_generator = None
         if pickup:

@@ -47,9 +47,12 @@ from isaaclab_rl.rsl_rl import RslRlVecEnvWrapper
 from unitree_rl_lab.utils.parser_cfg import parse_env_cfg
 
 TASK = "Unitree-G1-29dof-Velocity"
-TARGET_SAMPLES = 3
+TARGET_SAMPLES = 2  # lock the target on the first detection with valid depth
 TARGET_SPREAD_M = 0.15
 SETTLE_SECONDS = 0.5
+# Stop in the aisle in front of the object instead of walking straight at it (it sits inside the shelf).
+APPROACH_STANDOFF_M = 0.45  # robot pelvis to object, measured across the aisle
+APPROACH_STOP_M = 0.20  # how close to the approach spot counts as "there"
 
 
 def detection_xyz(camera_data, result, max_depth=6.0):
@@ -185,7 +188,7 @@ def walk_to_detection(env, policy, model, target_class, pickup=None):
     camera = scene["head_camera"]
     robot = scene["robot"]
     command = env.unwrapped.command_manager.get_term("base_velocity")
-    stop_distance = command.cfg.stop_distance
+    original_stop = command.cfg.stop_distance
     dt = env.unwrapped.step_dt
 
     obs = env.get_observations()
@@ -197,6 +200,8 @@ def walk_to_detection(env, policy, model, target_class, pickup=None):
     nearby_xyz = None
     settled_time = 0.0
     arrived = False
+    facing = False  # False = walking to the approach spot, True = turning to face the object
+    approach_time = 0.0
     step = 0
     last_detection_frame = -1
     print(f"[YOLO] Waiting for {args.target}.")
@@ -212,6 +217,9 @@ def walk_to_detection(env, policy, model, target_class, pickup=None):
                 samples.clear()
                 settled_time = 0.0
                 arrived = False
+                facing = False
+                approach_time = 0.0
+                command.cfg.stop_distance = original_stop
                 last_detection_frame = -1
                 if pickup is not None:
                     pickup.reset()
@@ -249,7 +257,13 @@ def walk_to_detection(env, policy, model, target_class, pickup=None):
                         continue
 
                     goal = candidate
-                    command.set_target_xy([0], goal[:2])
+                    # Walk to a spot in the aisle in front of the object (on the aisle side of it).
+                    side = 1.0 if (goal[1] - scene.env_origins[0, 1]).item() >= 0.0 else -1.0
+                    approach = goal[:2].clone()
+                    approach[1] -= side * APPROACH_STANDOFF_M
+                    command.cfg.stop_distance = APPROACH_STOP_M
+                    command.set_target_xy([0], approach)
+                    print(f"[AISLE] Walking to the spot in front of it: XY={approach.tolist()}")
                     # The next command update supplies Stage 1's existing target and yaw observations.
                     dx, dy = (goal[:2] - robot.data.root_pos_w[0, :2]).tolist()
                     yaw = command._root_yaw([0]).item()
@@ -263,24 +277,47 @@ def walk_to_detection(env, policy, model, target_class, pickup=None):
                     if point is not None and (point - goal).norm().item() < 0.12:
                         nearby_xyz = point if nearby_xyz is None else torch.lerp(nearby_xyz, point, 0.35)
 
-            if goal is not None and not arrived:
+            if goal is not None and not arrived and not facing:
+                # Step 1: walk to the approach spot. Once stopped there, aim at the object itself,
+                # with a stop distance larger than the standoff so it only turns on the spot.
+                distance = command.target_distance[0].item()
+                xy_speed = robot.data.root_lin_vel_w[0, :2].norm().item()
+                at_spot = distance <= command.cfg.stop_distance and xy_speed < 0.08
+                approach_time = approach_time + dt if at_spot else 0.0
+                if approach_time >= SETTLE_SECONDS:
+                    facing = True
+                    command.cfg.stop_distance = original_stop
+                    command.set_target_xy([0], goal[:2])
+                    print("[AISLE] In front of the shelf. Turning to face the object.")
+
+            elif goal is not None and not arrived:
+                # Step 2: turning to face the object, then settle and start the pickup.
                 distance = command.target_distance[0].item()
                 xy_speed = robot.data.root_lin_vel_w[0, :2].norm().item()
                 yaw_error = abs(command.metrics["target_yaw_error"][0].item())
                 yaw_rate = abs(robot.data.root_ang_vel_w[0, 2].item())
+                if step % 50 == 0:
+                    print(
+                        f"[DEBUG] dist={distance:.2f} (need <= {command.cfg.stop_distance:.2f})  "
+                        f"speed={xy_speed:.3f} (need < 0.05)  "
+                        f"yaw_err={math.degrees(yaw_error):.1f} deg (need < 8)  "
+                        f"yaw_rate={yaw_rate:.2f} (need < 0.1)"
+                    )
                 settled = (
-                    distance <= stop_distance
+                    distance <= command.cfg.stop_distance
                     and xy_speed < 0.05
-                    and yaw_error < math.radians(8)
-                    and yaw_rate < 0.1
+                    and yaw_error < math.radians(15)
+                    and yaw_rate < 0.3
                 )
                 settled_time = settled_time + dt if settled else 0.0
                 if settled_time >= SETTLE_SECONDS:
                     arrived = True
                     print(f"[AISLE] Settled {distance:.3f} m from the detected point.")
                     if pickup is not None:
-                        heading = command._root_yaw([0]).item()
-                        pickup.start(goal if nearby_xyz is None else nearby_xyz, heading)
+                        target = goal if nearby_xyz is None else nearby_xyz
+                        dx, dy = (target[:2] - robot.data.root_pos_w[0, :2]).tolist()
+                        heading = math.atan2(dy, dx)  # point the grasp at the banana even if the body is a few degrees off
+                        pickup.start(target, heading)
                     if args.target == "banana":
                         # Simulation diagnostic only. Navigation uses RGB-D exclusively.
                         banana_xy = goal.new_tensor(env.unwrapped.cfg.scene.target_object.init_state.pos[:2])

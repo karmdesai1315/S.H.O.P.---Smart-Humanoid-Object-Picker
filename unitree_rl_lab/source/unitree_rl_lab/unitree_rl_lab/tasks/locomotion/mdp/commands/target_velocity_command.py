@@ -93,6 +93,11 @@ class TargetVelocityCommand(UniformVelocityCommand):
             if self.cfg.fixed_forward_distance is None:
                 radius_min, radius_max = self.radius_range
                 radius = torch.empty(len(env_ids), device=self.device).uniform_(radius_min, radius_max)
+                # Some targets start inside the stop zone, so the robot has to turn on the spot to face them.
+                if self.cfg.near_target_fraction > 0.0:
+                    near = torch.rand(len(env_ids), device=self.device) < self.cfg.near_target_fraction
+                    near_radius = torch.empty(len(env_ids), device=self.device).uniform_(*self.cfg.near_radius_range)
+                    radius = torch.where(near, near_radius, radius)
                 angle = torch.empty(len(env_ids), device=self.device).uniform_(*self.cfg.target_angle_range)
                 heading = yaw + angle
             else:
@@ -194,3 +199,5 @@ class TargetVelocityCommandCfg(UniformLevelVelocityCommandCfg):
     radius_increment: float = 0.5  # metres per successful curriculum update
     position_gain: float = 0.5  # 1/(m*s), multiplying signed squared position error
     stop_distance: float = 0.2  # metres
+    near_target_fraction: float = 0.0  # share of episodes whose target starts inside the stop zone (turn in place)
+    near_radius_range: tuple[float, float] = (0.25, 0.45)  # metres, keep below stop_distance

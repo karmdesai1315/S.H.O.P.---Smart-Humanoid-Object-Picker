@@ -38,7 +38,18 @@ def target_stop_reward(env: ManagerBasedRLEnv, std: float, command_name: str = "
     speed_squared = command.robot.data.root_lin_vel_w[:, :2].square().sum(dim=-1)
     return torch.exp(-speed_squared / std**2) * (command.target_distance <= command.cfg.stop_distance)
 
-
+def target_heading_reward(env: ManagerBasedRLEnv, std: float = 0.5, command_name: str = "base_velocity") -> torch.Tensor:
+    """Reward facing the target, inside the stop zone only (where the robot should turn on the spot)."""
+    command = env.command_manager.get_term(command_name)
+    error_w = command.target_pos_w - command.robot.data.root_pos_w[:, :2]
+    distance = torch.linalg.vector_norm(error_w, dim=-1)
+    bearing = torch.atan2(error_w[:, 1], error_w[:, 0])
+    yaw = command._root_yaw(slice(None))
+    yaw_error = (bearing - yaw + torch.pi) % (2.0 * torch.pi) - torch.pi
+    # ignore targets right under the robot, where the direction is meaningless
+    inside = (distance <= command.cfg.stop_distance) & (distance > 0.1)
+    return torch.exp(-yaw_error.square() / std**2) * inside
+    
 def pickup_base_drift(env: ManagerBasedRLEnv) -> torch.Tensor:
     """Penalize base speed and XY displacement from the point where pickup started."""
     action = env.action_manager.get_term("JointPositionAction")
